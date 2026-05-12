@@ -1,0 +1,24 @@
+# Runtime data — analyzed tracks and per-track JSON live here
+/data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+backend/.venv/
+backend/.pytest_cache/
+backend/uv.lock
+backend/tests/fixtures/*.wav
+backend/tests/fixtures/*.decoded.wav
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
