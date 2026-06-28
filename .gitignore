@@ -9,13 +9,11 @@ __pycache__/
 backend/.venv/
 backend/.pytest_cache/
 backend/uv.lock
+backend/bin/
+backend/downloads/
+backend/dist/
 backend/tests/fixtures/*.wav
 backend/tests/fixtures/*.decoded.wav
-
-# Node
-node_modules/
-frontend/dist/
-frontend/.vite/
 
 # OS / editor
 .DS_Store
