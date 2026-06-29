@@ -546,6 +546,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
 
     new_entries = [entry for entry in entries if entry.id in set(diff.added_ids)]
     downloaded_paths: list[Path] = []
+    failed_downloads: list[dict[str, str]] = []
     if new_entries:
         results = download_entries(
             new_entries,
@@ -556,20 +557,36 @@ def _cmd_sync(args: argparse.Namespace) -> int:
             archive=archive,
             status=lambda message: _emit("status", message=message),
         )
-        failed = [r for r in results if not r.ok]
         for result in results:
             if result.ok:
                 downloaded_paths.extend(result.output_paths)
-        if failed:
+            else:
+                failed_downloads.append(
+                    {
+                        "id": result.entry.id or "",
+                        "title": result.entry.label,
+                        "url": result.entry.url,
+                        "error": result.error or "unknown",
+                    }
+                )
+        if failed_downloads:
             _emit(
                 "status",
-                message=f"failed {len(failed)} track(s); continuing with the rest",
+                message=f"failed {len(failed_downloads)} track(s); continuing with the rest",
+            )
+            failed_path = target_dir / "failed-downloads.txt"
+            failed_path.write_text(
+                "\n".join(f"{f['id']}\t{f['title']}\t{f['error']}" for f in failed_downloads)
+                + "\n"
             )
     else:
         _emit("status", message="No new tracks to download.")
 
     # Paths covered by the playlist now = current SoundCloud entries' MP3s present on disk
     current_paths = sorted(set(paths_for_entries(target_dir, entries)))
+    # Successfully-tracked IDs are the ones we have an MP3 for. Failed downloads are
+    # excluded so the next sync retries them instead of treating them as synced.
+    tracked_ids = _ids_from_paths(current_paths)
     # Resolve removed track MP3 paths (best-effort: look for any local file with [id] suffix)
     removed_paths = _resolve_removed_paths(target_dir, diff.removed_ids)
 
@@ -621,11 +638,13 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         state.rekordbox_playlist = result.playlist_name
         state.rekordbox_playlist_id = result.playlist_id
 
-    # Update sync state regardless of push (so deltas track correctly next time)
+    # Update sync state regardless of push (so deltas track correctly next time).
+    # Only persist IDs we actually have an MP3 for — failed downloads must be
+    # retried on the next sync, not silently treated as synced.
     state.url = url
     state.title = title
     state.target_dir = str(target_dir)
-    state.track_ids = current_ids
+    state.track_ids = tracked_ids
     state.last_synced_at = _dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
     save_state(state)
 
@@ -638,10 +657,22 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         removed=len(diff.removed_ids),
         unchanged=len(diff.unchanged_ids),
         analyzed=len(features),
+        failed_downloads=failed_downloads,
         push=push_summary,
         features=[features_to_dict(item) for item in features],
     )
     return 0
+
+
+def _ids_from_paths(paths: list[Path]) -> list[str]:
+    import re as _re
+
+    ids: list[str] = []
+    for path in paths:
+        match = _re.search(r"\[(\d{5,})\]\.mp3$", path.name)
+        if match:
+            ids.append(match.group(1))
+    return ids
 
 
 def _resolve_removed_paths(target_dir: Path, removed_ids: list[str]) -> list[Path]:

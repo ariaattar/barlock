@@ -469,7 +469,13 @@ class TuiApp {
             )
           }, flow())
           const push = (final.push || {}) as Record<string, unknown>
-          await this.message("Sync Complete", [
+          const failedDownloads = (final.failed_downloads || []) as Array<{
+            id: string
+            title: string
+            url: string
+            error: string
+          }>
+          const lines: string[] = [
             `Title: ${final.title}`,
             `Folder: ${final.target_dir}`,
             `Added: ${final.added}   Removed: ${final.removed}   Unchanged: ${final.unchanged}`,
@@ -480,7 +486,21 @@ class TuiApp {
               ? `Added to playlist: ${push.added_to_playlist}   Removed: ${push.removed_from_playlist}   Cues: ${push.added_cues}   Loops: ${push.added_loops}`
               : "",
             push.backup_dir ? `Backup: ${push.backup_dir}` : "",
-          ].filter(Boolean) as string[], "Done", flow(), false)
+          ]
+          if (failedDownloads.length) {
+            lines.push("")
+            lines.push(`⚠  ${failedDownloads.length} track(s) could not be downloaded:`)
+            for (const failure of failedDownloads.slice(0, 8)) {
+              const label = failure.title || failure.url || failure.id || "(unknown)"
+              const reason = failure.error ? ` — ${truncateReason(failure.error)}` : ""
+              lines.push(`   • ${label}${reason}`)
+            }
+            if (failedDownloads.length > 8) {
+              lines.push(`   • ... ${failedDownloads.length - 8} more (see failed-downloads.txt)`)
+            }
+            lines.push(`   These will be retried next sync.`)
+          }
+          await this.message("Sync Complete", lines.filter(Boolean) as string[], "Done", flow(), false)
           return
         }
       } catch (error) {
@@ -832,6 +852,11 @@ function renderSparkline(values: number[] | undefined, width: number): string {
     out.push(SPARK_CHARS[idx])
   }
   return out.join("")
+}
+
+function truncateReason(reason: string): string {
+  const single = reason.replace(/\s+/g, " ").trim()
+  return single.length > 90 ? single.slice(0, 87) + "..." : single
 }
 
 function vocalBadgeFor(vocalClass: string | undefined): string {
