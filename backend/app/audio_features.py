@@ -14,7 +14,7 @@ import numpy as np
 import soundfile as sf
 
 AUDIO_EXTS = {".mp3", ".wav", ".aiff", ".aif", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
-ANALYSIS_VERSION = 10
+ANALYSIS_VERSION = 11
 ENERGY_CURVE_BINS = 256
 
 NOTE_NAMES = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
@@ -1259,54 +1259,74 @@ def _cue_hints(
     structural = segmentation_mode == "structural"
     by_label = {s.label: s for s in sections}
 
-    if structural:
-        build = by_label.get("build")
-        drop = by_label.get("drop")
-        breakdown = by_label.get("breakdown")
-        last_drop = by_label.get("last_drop")
-        outro = by_label.get("outro")
+    # Each pad assessed independently. The contract is "pad C is always the drop
+    # or safe mix-in" — so a confidently-detected drop (from sections or energy
+    # curve) takes pad C, and Phrase 32 is the fallback name when we have no
+    # better signal. Same idea for Build (pad B) and Breakdown (pad F).
+    build_section = by_label.get("build")
+    drop_section = by_label.get("drop")
+    breakdown_section = by_label.get("breakdown")
+    last_drop_section = by_label.get("last_drop")
+    outro_section = by_label.get("outro")
+
+    heuristic_breakdown_sec, heuristic_drop_sec = _heuristic_drop_breakdown(
+        duration=duration,
+        bar=bar,
+        first_downbeat=first_downbeat,
+        energy_curve=energy_curve,
+    )
+
+    # Pad B: prefer section-labeled Build, otherwise fall back to bar*16.
+    if build_section is not None:
         pad_b_name = "Build"
-        pad_b_sec = build.start_sec if build is not None else (intro_start + bar * 16)
-        if build is None:
-            pad_b_name = "Phrase 16"
-        pad_c_name = "Drop"
-        pad_c_sec = drop.start_sec if drop is not None else (intro_start + bar * 32)
-        if drop is None:
-            pad_c_name = "Phrase 32"
-        pad_f = (
-            CueHint("Breakdown", breakdown.start_sec, "hot", 5)
-            if breakdown is not None
-            else None
-        )
-        pad_g = (
-            CueHint("Last Drop", last_drop.start_sec, "hot", 6)
-            if last_drop is not None
-            else None
-        )
-        outro_sec = outro.start_sec if outro is not None else max(0.0, duration - bar * 32)
+        pad_b_sec = build_section.start_sec
     else:
         pad_b_name = "Phrase 16"
         pad_b_sec = max(0.0, first_downbeat + bar * 16)
+
+    # Pad C: prefer section-labeled Drop, then heuristic energy-peak Drop, then bar*32.
+    if drop_section is not None:
+        pad_c_name = "Drop"
+        pad_c_sec = drop_section.start_sec
+    elif heuristic_drop_sec is not None:
+        pad_c_name = "Drop"
+        pad_c_sec = heuristic_drop_sec
+    else:
         pad_c_name = "Phrase 32"
         pad_c_sec = max(0.0, first_downbeat + bar * 32)
-        breakdown_sec, drop_sec = _heuristic_drop_breakdown(
-            duration=duration,
-            bar=bar,
-            first_downbeat=first_downbeat,
-            energy_curve=energy_curve,
-        )
-        pad_f = (
-            CueHint("Breakdown", breakdown_sec, "memory", None)
-            if breakdown_sec is not None
-            else None
-        )
-        # Drop in heuristic mode lands as memory cue (the hot slot is already Phrase 32)
-        pad_g = (
-            CueHint("Drop", drop_sec, "memory", None)
-            if drop_sec is not None
-            else None
-        )
-        outro_sec = max(0.0, duration - bar * 32)
+
+    # Pad F (slot 5): Breakdown as hot cue when we have section or energy
+    # detection. Avoid clashing with a section-labeled drop on pad C — they
+    # could be sourced from different bars and a Breakdown shouldn't land
+    # within a bar of the drop.
+    breakdown_sec: float | None = None
+    if breakdown_section is not None:
+        breakdown_sec = breakdown_section.start_sec
+    elif heuristic_breakdown_sec is not None:
+        breakdown_sec = heuristic_breakdown_sec
+    if breakdown_sec is not None and pad_c_name == "Drop":
+        if abs(breakdown_sec - pad_c_sec) < bar * 2.0:
+            breakdown_sec = None
+    pad_f = (
+        CueHint("Breakdown", breakdown_sec, "hot", 5)
+        if breakdown_sec is not None
+        else None
+    )
+
+    # Pad G (slot 6): Last Drop only when we have section evidence — energy
+    # curves don't reliably distinguish a second drop from sustained energy.
+    pad_g = (
+        CueHint("Last Drop", last_drop_section.start_sec, "hot", 6)
+        if last_drop_section is not None
+        else None
+    )
+
+    # Outro: prefer section start, otherwise bar*32 from the end.
+    outro_sec = (
+        outro_section.start_sec
+        if outro_section is not None
+        else max(0.0, duration - bar * 32)
+    )
 
     intro_loop = (
         _best_intro_loop_candidate(
@@ -1314,7 +1334,7 @@ def _cue_hints(
             bar=bar,
             first_downbeat=first_downbeat,
             loop_profile=loop_profile,
-            sections=sections if structural else None,
+            sections=sections or None,
         )
         if loop_profile is not None
         else None
@@ -1325,7 +1345,7 @@ def _cue_hints(
             bar=bar,
             first_downbeat=first_downbeat,
             loop_profile=loop_profile,
-            sections=sections if structural else None,
+            sections=sections or None,
         )
         if loop_profile is not None
         else None

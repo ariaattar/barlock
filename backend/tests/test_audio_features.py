@@ -107,6 +107,68 @@ def test_pad_c_is_drop_slot_in_both_modes():
     assert struct_pad_c.kind == "hot"
 
 
+def test_pad_c_uses_heuristic_drop_when_energy_peak_is_confident():
+    """Even without structural mode, a confident energy-curve drop should land
+    on pad C as 'Drop' instead of falling back to bar-32 Phrase 32."""
+    curve = [0.2] * 256
+    for idx in range(80, 110):
+        curve[idx] = 0.9  # clear peak around 62-86s of a 200s track
+
+    cues = _cue_hints(
+        duration=200.0,
+        bpm=120.0,
+        first_downbeat=0.0,
+        energy_curve=curve,
+        # heuristic mode is the default — no structural confidence
+    )
+
+    pad_c = next(c for c in cues if c.hotcue_slot == 2)
+    assert pad_c.name == "Drop"
+    assert pad_c.kind == "hot"
+    # And it lands somewhere inside the energy peak window
+    assert 60.0 <= pad_c.seconds <= 90.0
+
+
+def test_pad_b_uses_section_build_in_heuristic_mode():
+    """A section labeled 'build' should claim pad B even when overall
+    segmentation confidence is too low for structural mode."""
+    sections = [
+        Section(start_sec=0.0, end_sec=24.0, label="intro", confidence=0.5),
+        Section(start_sec=24.0, end_sec=48.0, label="build", confidence=0.5),
+        Section(start_sec=48.0, end_sec=200.0, label="outro", confidence=0.5),
+    ]
+    cues = _cue_hints(
+        duration=200.0,
+        bpm=120.0,
+        first_downbeat=0.0,
+        sections=sections,
+        segmentation_mode="heuristic",
+    )
+    pad_b = next(c for c in cues if c.hotcue_slot == 1)
+    assert pad_b.name == "Build"
+    assert pad_b.seconds == 24.0
+
+
+def test_pad_f_breakdown_avoids_clashing_with_pad_c_drop():
+    """When sections place Drop and Breakdown within a bar of each other we
+    should drop the Breakdown rather than have two adjacent hot cues."""
+    sections = [
+        Section(start_sec=0.0, end_sec=30.0, label="intro", confidence=0.9),
+        Section(start_sec=30.0, end_sec=33.0, label="breakdown", confidence=0.9),
+        Section(start_sec=33.0, end_sec=96.0, label="drop", confidence=0.9),
+        Section(start_sec=96.0, end_sec=240.0, label="outro", confidence=0.9),
+    ]
+    cues = _cue_hints(
+        duration=240.0,
+        bpm=120.0,
+        first_downbeat=0.0,
+        sections=sections,
+        segmentation_mode="structural",
+    )
+    assert any(c.name == "Drop" for c in cues)
+    assert not any(c.name == "Breakdown" for c in cues)
+
+
 def test_auto_cue_hints_write_scored_intro_and_exit_loops():
     duration = 240.0
     times = np.linspace(0.0, duration, 481)
