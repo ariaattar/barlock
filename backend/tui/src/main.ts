@@ -255,6 +255,11 @@ class TuiApp {
             value: "likes",
           },
           {
+            label: "Reanalyze a Rekordbox playlist",
+            description: "Re-run cue analysis on tracks already in Rekordbox",
+            value: "reanalyze",
+          },
+          {
             label: "Rekordbox doctor",
             description: "Collection, missing-file, and import checks",
             value: "doctor",
@@ -273,6 +278,8 @@ class TuiApp {
           await this.syncFlow()
         } else if (choice === "likes") {
           await this.syncFlow(this.config.likes_url)
+        } else if (choice === "reanalyze") {
+          await this.reanalyzeFlow()
         } else if (choice === "doctor") {
           await this.doctorFlow()
         } else if (choice === "settings") {
@@ -516,6 +523,253 @@ class TuiApp {
     }
     } finally {
       this.subtitle = previousSubtitle
+    }
+  }
+
+  private async reanalyzeFlow(): Promise<void> {
+    const previousSubtitle = this.subtitle
+    type TrackRow = {
+      content_id: string
+      title: string
+      artist: string
+      folder_path: string
+      file_exists: boolean
+      soundcloud_dl_managed: boolean
+    }
+    const stepLabels = ["Playlist", "Scope", "Confirm", "Run"]
+    let step = 0
+    let playlist: Playlist | undefined
+    let tracks: TrackRow[] | undefined
+    let scope: "all" | "subset" | undefined
+    let selectedIds: string[] | undefined
+    const flow = () => ({
+      name: "Reanalyze",
+      step: step + 1,
+      total: stepLabels.length,
+      label: stepLabels[step],
+    })
+
+    try {
+      while (step < stepLabels.length && this.running) {
+        try {
+          const current = stepLabels[step]
+          if (current === "Playlist") {
+            playlist = await this.pickRekordboxPlaylist(flow())
+            this.subtitle = `Rekordbox: ${playlist.path}`
+            tracks = undefined
+            scope = undefined
+            selectedIds = undefined
+            step += 1
+          } else if (current === "Scope") {
+            if (!playlist) {
+              step = 0
+              continue
+            }
+            if (!tracks) {
+              tracks = await this.status("Reading playlist", ["Loading tracks from Rekordbox..."], async (write) => {
+                const raw = await this.bridge.json("list-playlist-tracks", ["--playlist-id", playlist!.id])
+                const list = (raw.tracks || []) as TrackRow[]
+                write(`Found ${list.length} track(s).`)
+                return list
+              }, flow())
+            }
+            if (!tracks.length) {
+              await this.message("Empty Playlist", ["This playlist has no tracks."], "Back", flow())
+              return
+            }
+            const missingCount = tracks.filter((t) => !t.file_exists).length
+            const scopeChoice = await this.select(
+              "Reanalyze Scope",
+              [
+                {
+                  label: `All ${tracks.length} track(s)`,
+                  description: missingCount ? `${missingCount} have missing files and will be skipped` : "",
+                  value: "all" as const,
+                },
+                {
+                  label: "Pick individual tracks",
+                  description: "Multi-select picker",
+                  value: "subset" as const,
+                },
+              ],
+              { flow: flow() },
+            )
+            scope = scopeChoice
+            if (scope === "subset") {
+              selectedIds = await this.pickTracks(tracks, flow())
+              if (!selectedIds.length) {
+                return
+              }
+            } else {
+              selectedIds = tracks.filter((t) => t.file_exists).map((t) => t.content_id)
+            }
+            step += 1
+          } else if (current === "Confirm") {
+            if (!playlist || !tracks || !selectedIds) {
+              step = Math.max(0, step - 1)
+              continue
+            }
+            const runnable = tracks.filter((t) => selectedIds!.includes(t.content_id) && t.file_exists)
+            const missing = tracks.filter((t) => selectedIds!.includes(t.content_id) && !t.file_exists)
+            const lines = [
+              `Reanalyze ${runnable.length} track(s) in "${playlist.name}".`,
+              missing.length ? `${missing.length} track(s) have missing files and will be skipped.` : "",
+              "Cache will be bypassed so the latest analyzer runs.",
+              "Auto-generated cues will be rewritten in Rekordbox.",
+            ].filter(Boolean) as string[]
+            const confirmed = await this.confirm("Confirm Reanalyze", lines, true, flow())
+            if (!confirmed) {
+              return
+            }
+            const running = await this.bridge.json("rekordbox-running")
+            if (running.running) {
+              const action = await this.select("Rekordbox Is Open", [
+                { label: "Close Rekordbox and continue", description: "Required for direct DB writes", value: "close" },
+                { label: "I closed it, check again", value: "check" },
+                { label: "Cancel", value: "cancel" },
+              ], { flow: flow() })
+              if (action === "cancel") {
+                return
+              }
+              if (action === "close") {
+                await this.status("Closing Rekordbox", ["Asking Rekordbox to quit..."], async () => {
+                  return await this.bridge.json("close-rekordbox")
+                }, flow())
+              }
+              const after = await this.bridge.json("rekordbox-running")
+              if (after.running) {
+                await this.message("Rekordbox Still Open", ["Close Rekordbox, then try again."], "Back", flow())
+                return
+              }
+            }
+            step += 1
+          } else if (current === "Run") {
+            if (!playlist || !selectedIds) {
+              step = Math.max(0, step - 1)
+              continue
+            }
+            const final = await this.status("Reanalyzing", [], async (write) => {
+              return await this.bridge.events(
+                "reanalyze-playlist",
+                [],
+                {
+                  playlist_id: playlist!.id,
+                  content_ids: selectedIds,
+                  force_no_cache: true,
+                },
+                (event) => {
+                  if (event.message) {
+                    write(String(event.message))
+                  }
+                },
+              )
+            }, flow())
+            const missing = (final.missing || []) as TrackRow[]
+            const lines: string[] = [
+              `Playlist: ${final.playlist_name}`,
+              `Analyzed: ${final.analyzed}`,
+              `Cues added: ${final.added_cues}   Loops added: ${final.added_loops}`,
+              `Backup: ${final.backup_dir}`,
+            ]
+            if (missing.length) {
+              lines.push("")
+              lines.push(`⚠  ${missing.length} track(s) skipped (file missing):`)
+              for (const t of missing.slice(0, 8)) {
+                const label = t.title || t.folder_path || t.content_id
+                lines.push(`   • ${label}`)
+              }
+              if (missing.length > 8) {
+                lines.push(`   • ... ${missing.length - 8} more`)
+              }
+            }
+            await this.message("Reanalyze Complete", lines, "Done", flow(), false)
+            return
+          }
+        } catch (error) {
+          if (error instanceof Back) {
+            if (step === 0) {
+              return
+            }
+            step -= 1
+            continue
+          }
+          throw error
+        }
+      }
+    } finally {
+      this.subtitle = previousSubtitle
+    }
+  }
+
+  private async pickRekordboxPlaylist(flow?: FlowProgress): Promise<Playlist> {
+    const raw = await this.bridge.json("list-playlists")
+    const playlists = ((raw.playlists || []) as Playlist[]).filter((pl) => !pl.is_folder)
+    if (!playlists.length) {
+      throw new Error("No Rekordbox playlists found.")
+    }
+    const search = (await this.input("Search Playlists", "Substring (blank for all)", "", { flow })).trim().toLowerCase()
+    const matches = search
+      ? playlists.filter((pl) => pl.path.toLowerCase().includes(search))
+      : playlists
+    if (!matches.length) {
+      throw new Error("No matching Rekordbox playlists found.")
+    }
+    return await this.select(
+      "Select Playlist",
+      matches.slice(0, 60).map((pl) => ({
+        label: pl.path,
+        description: `${pl.song_count} track(s)`,
+        value: pl,
+      })),
+      { flow },
+    )
+  }
+
+  private async pickTracks(
+    tracks: Array<{ content_id: string; title: string; artist: string; file_exists: boolean }>,
+    flow?: FlowProgress,
+  ): Promise<string[]> {
+    const selected = new Set<string>()
+    while (true) {
+      const items: SelectItem<string>[] = [
+        { label: `✔ Done — ${selected.size} selected`, value: "__done__" },
+        { label: "Select all", value: "__all__" },
+        { label: "Clear selection", value: "__clear__" },
+      ]
+      for (const t of tracks) {
+        const mark = selected.has(t.content_id) ? "[x]" : "[ ]"
+        const warn = t.file_exists ? "" : "  (missing)"
+        const artist = t.artist ? `${t.artist} - ` : ""
+        items.push({
+          label: `${mark} ${artist}${t.title}${warn}`,
+          value: t.content_id,
+        })
+      }
+      const choice = await this.select(
+        "Pick Tracks (Enter toggles, Done to continue)",
+        items,
+        { flow },
+      )
+      if (choice === "__done__") {
+        return Array.from(selected)
+      }
+      if (choice === "__all__") {
+        for (const t of tracks) {
+          if (t.file_exists) {
+            selected.add(t.content_id)
+          }
+        }
+        continue
+      }
+      if (choice === "__clear__") {
+        selected.clear()
+        continue
+      }
+      if (selected.has(choice)) {
+        selected.delete(choice)
+      } else {
+        selected.add(choice)
+      }
     }
   }
 

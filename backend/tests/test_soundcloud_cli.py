@@ -223,6 +223,86 @@ def test_parallel_analyze_falls_back_to_serial_for_small_batches(monkeypatch, tm
     assert [Path(f.path).name for f in result] == [p.name for p in paths]
 
 
+def test_reanalyze_playlist_filters_by_content_ids_and_skips_missing(monkeypatch, tmp_path):
+    """The reanalyze handler honors the content_ids filter, drops files that
+    don't exist on disk, and pushes the rest back to the same playlist."""
+    from app import soundcloud_bridge
+    from app.rekordbox_sync import PlaylistTrack
+
+    existing = tmp_path / "present.mp3"
+    existing.write_bytes(b"")
+    missing = tmp_path / "gone.mp3"
+    other = tmp_path / "not-selected.mp3"
+    other.write_bytes(b"")
+
+    fake_tracks = [
+        PlaylistTrack("c1", "Present", "", str(existing), True, True),
+        PlaylistTrack("c2", "Gone", "", str(missing), False, True),
+        PlaylistTrack("c3", "Other", "", str(other), True, True),
+    ]
+    monkeypatch.setattr(soundcloud_bridge, "list_playlist_tracks", lambda pid: fake_tracks)
+    monkeypatch.setattr(soundcloud_bridge, "rekordbox_running", lambda: False)
+    monkeypatch.setattr(
+        soundcloud_bridge,
+        "list_playlists",
+        lambda: [SimpleNamespace(id="pl-1", name="Set", path="Set", is_folder=False, song_count=3)],
+    )
+
+    analyzed_paths: list[Path] = []
+
+    def fake_parallel(paths, **kwargs):
+        analyzed_paths.extend(paths)
+        return [_features(p) for p in paths]
+
+    pushed: dict[str, object] = {}
+
+    def fake_push(features, *, playlist_name, create_playlist, playlist_id=None, remove_paths=None):
+        pushed["features"] = [Path(f.path).name for f in features]
+        pushed["playlist_id"] = playlist_id
+        pushed["create_playlist"] = create_playlist
+        return SimpleNamespace(
+            playlist_name=playlist_name,
+            playlist_id=playlist_id or "pl-1",
+            added_to_collection=0,
+            already_in_collection=len(features),
+            added_to_playlist=0,
+            already_in_playlist=len(features),
+            removed_from_playlist=0,
+            added_cues=3,
+            skipped_cues=0,
+            added_loops=2,
+            skipped_loops=0,
+            backup_dir=tmp_path / "backup",
+        )
+
+    monkeypatch.setattr(soundcloud_bridge, "_analyze_paths_parallel", fake_parallel)
+    monkeypatch.setattr(soundcloud_bridge, "push_tracks_to_playlist", fake_push)
+    monkeypatch.setattr(soundcloud_bridge, "write_id3_tags", lambda *a, **k: None)
+
+    emitted: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(soundcloud_bridge, "_emit", lambda event, **payload: emitted.append((event, payload)))
+    monkeypatch.setattr(
+        soundcloud_bridge,
+        "_load_payload",
+        lambda _: {"playlist_id": "pl-1", "content_ids": ["c1", "c2"], "force_no_cache": True},
+    )
+
+    rc = soundcloud_bridge._cmd_reanalyze_playlist(SimpleNamespace(payload="-"))
+
+    assert rc == 0
+    # c3 was not requested; c2 is missing on disk; only c1 should be analyzed.
+    assert [p.name for p in analyzed_paths] == ["present.mp3"]
+    assert pushed["features"] == ["present.mp3"]
+    assert pushed["playlist_id"] == "pl-1"
+    assert pushed["create_playlist"] is False
+    final_event = next((p for ev, p in emitted if ev == "done"), None)
+    assert final_event is not None
+    assert final_event["analyzed"] == 1
+    assert final_event["skipped_missing"] == 1
+    assert final_event["added_cues"] == 3
+    assert any(m["content_id"] == "c2" for m in final_event["missing"])
+
+
 def _features(path: Path) -> TrackFeatures:
     return TrackFeatures(
         path=str(path),

@@ -93,6 +93,52 @@ def backup_rekordbox() -> Path:
     return backup_dir
 
 
+@dataclass(frozen=True)
+class PlaylistTrack:
+    content_id: str
+    title: str
+    artist: str
+    folder_path: str
+    file_exists: bool
+    soundcloud_dl_managed: bool
+
+
+def list_playlist_tracks(playlist_id: str) -> list[PlaylistTrack]:
+    db = Rekordbox6Database()
+    try:
+        playlist = db.get_playlist(ID=playlist_id)
+        if playlist is None:
+            raise ValueError(f"playlist not found: {playlist_id}")
+        if playlist.is_folder:
+            raise ValueError(f"'{playlist.Name}' is a folder, not a playlist")
+        out: list[PlaylistTrack] = []
+        for song in db.get_playlist_songs(PlaylistID=playlist.ID).all():
+            content = song.Content
+            if content is None:
+                continue
+            path = str(content.FolderPath or "")
+            artist_name = ""
+            try:
+                if content.Artist is not None:
+                    artist_name = str(content.Artist.Name or "")
+            except Exception:
+                pass
+            comment = str(getattr(content, "Commnt", "") or "")
+            out.append(
+                PlaylistTrack(
+                    content_id=str(content.ID),
+                    title=str(content.Title or Path(path).stem or ""),
+                    artist=artist_name,
+                    folder_path=path,
+                    file_exists=bool(path) and Path(path).exists(),
+                    soundcloud_dl_managed=comment.strip().startswith("soundcloud-dl"),
+                )
+            )
+        return out
+    finally:
+        db.close()
+
+
 def list_playlists() -> list[PlaylistInfo]:
     db = Rekordbox6Database()
     try:

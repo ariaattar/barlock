@@ -14,6 +14,7 @@ from .audio_features import TrackFeatures, analyze_file, analyze_one_worker, aud
 from .rekordbox_sync import (
     close_rekordbox,
     doctor,
+    list_playlist_tracks,
     list_playlists,
     push_tracks_to_playlist,
     rekordbox_running,
@@ -117,6 +118,14 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser = subparsers.add_parser("sync")
     sync_parser.add_argument("--payload", default="-")
     sync_parser.set_defaults(handler=_cmd_sync)
+
+    list_tracks_parser = subparsers.add_parser("list-playlist-tracks")
+    list_tracks_parser.add_argument("--playlist-id", required=True)
+    list_tracks_parser.set_defaults(handler=_cmd_list_playlist_tracks)
+
+    reanalyze_parser = subparsers.add_parser("reanalyze-playlist")
+    reanalyze_parser.add_argument("--payload", default="-")
+    reanalyze_parser.set_defaults(handler=_cmd_reanalyze_playlist)
 
     return parser
 
@@ -660,6 +669,107 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         failed_downloads=failed_downloads,
         push=push_summary,
         features=[features_to_dict(item) for item in features],
+    )
+    return 0
+
+
+def _cmd_list_playlist_tracks(args: argparse.Namespace) -> int:
+    tracks = list_playlist_tracks(args.playlist_id)
+    _print_json(
+        {
+            "ok": True,
+            "tracks": [
+                {
+                    "content_id": t.content_id,
+                    "title": t.title,
+                    "artist": t.artist,
+                    "folder_path": t.folder_path,
+                    "file_exists": t.file_exists,
+                    "soundcloud_dl_managed": t.soundcloud_dl_managed,
+                }
+                for t in tracks
+            ],
+        }
+    )
+    return 0
+
+
+def _cmd_reanalyze_playlist(args: argparse.Namespace) -> int:
+    payload = _load_payload(args.payload)
+    playlist_id = str(payload.get("playlist_id") or "").strip()
+    if not playlist_id:
+        raise ValueError("payload.playlist_id is required")
+    selected_ids: set[str] | None = None
+    if payload.get("content_ids"):
+        selected_ids = {str(cid) for cid in payload["content_ids"]}
+    force_no_cache = bool(payload.get("force_no_cache", True))
+
+    # Fail fast before doing any analysis work — analysis is expensive and the
+    # push won't run if Rekordbox is open.
+    if rekordbox_running():
+        raise RuntimeError("Close Rekordbox before reanalyze (so cues can be written).")
+
+    tracks = list_playlist_tracks(playlist_id)
+    if selected_ids is not None:
+        tracks = [t for t in tracks if t.content_id in selected_ids]
+    if not tracks:
+        raise ValueError("no tracks to reanalyze")
+
+    missing = [t for t in tracks if not t.file_exists]
+    runnable = [t for t in tracks if t.file_exists]
+    if missing:
+        _emit(
+            "status",
+            message=f"skipping {len(missing)} track(s) with missing files",
+        )
+    if not runnable:
+        raise RuntimeError("no playable files for the selected tracks")
+
+    config = load_config()
+    paths = [Path(t.folder_path) for t in runnable]
+    raw_features = _analyze_paths_parallel(
+        paths,
+        output_dir=None,  # use each track's parent folder for the analysis cache
+        extract_vocal_stems=config.extract_vocal_stems,
+        use_cache=not force_no_cache,
+    )
+
+    # Tags pass: rewrite ID3 metadata so on-deck displays match the new analysis.
+    if config.write_tags:
+        for item in raw_features:
+            try:
+                write_id3_tags(Path(item.path), item)
+            except Exception as exc:
+                _emit("status", message=f"tag write failed for {Path(item.path).name}: {exc}")
+
+    # Look up the playlist's current name so push_tracks_to_playlist writes back to the same place.
+    playlists = list_playlists()
+    playlist_match = next((pl for pl in playlists if pl.id == playlist_id), None)
+    playlist_name = playlist_match.name if playlist_match else ""
+
+    result = push_tracks_to_playlist(
+        raw_features,
+        playlist_name=playlist_name,
+        playlist_id=playlist_id,
+        create_playlist=False,
+    )
+
+    _emit(
+        "done",
+        ok=True,
+        playlist_id=result.playlist_id,
+        playlist_name=result.playlist_name,
+        analyzed=len(raw_features),
+        skipped_missing=len(missing),
+        added_to_playlist=result.added_to_playlist,
+        already_in_playlist=result.already_in_playlist,
+        added_cues=result.added_cues,
+        added_loops=result.added_loops,
+        backup_dir=str(result.backup_dir),
+        missing=[
+            {"content_id": t.content_id, "title": t.title, "folder_path": t.folder_path}
+            for t in missing
+        ],
     )
     return 0
 
