@@ -702,27 +702,64 @@ class TuiApp {
   }
 
   private async pickRekordboxPlaylist(flow?: FlowProgress): Promise<Playlist> {
-    const raw = await this.bridge.json("list-playlists")
-    const playlists = ((raw.playlists || []) as Playlist[]).filter((pl) => !pl.is_folder)
+    const playlists = await this.status(
+      "Loading Rekordbox Playlists",
+      ["Reading playlists from Rekordbox..."],
+      async (write) => {
+        const raw = await this.bridge.json("list-playlists")
+        const list = ((raw.playlists || []) as Playlist[]).filter((pl) => !pl.is_folder)
+        write(`Found ${list.length} playlist(s).`)
+        return list
+      },
+      flow,
+    )
     if (!playlists.length) {
       throw new Error("No Rekordbox playlists found.")
     }
-    const search = (await this.input("Search Playlists", "Substring (blank for all)", "", { flow })).trim().toLowerCase()
-    const matches = search
-      ? playlists.filter((pl) => pl.path.toLowerCase().includes(search))
-      : playlists
-    if (!matches.length) {
-      throw new Error("No matching Rekordbox playlists found.")
+
+    const sortedPlaylists = [...playlists].sort((a, b) => b.song_count - a.song_count)
+    let filtered = sortedPlaylists
+    while (true) {
+      const filterLabel = filtered === sortedPlaylists
+        ? `🔍  Search (showing all ${sortedPlaylists.length})`
+        : `🔍  Search (filtered to ${filtered.length} of ${sortedPlaylists.length})`
+      const items: SelectItem<Playlist | "__search__" | "__clear__">[] = [
+        { label: filterLabel, value: "__search__" },
+      ]
+      if (filtered !== sortedPlaylists) {
+        items.push({ label: "✕  Clear search", value: "__clear__" })
+      }
+      for (const pl of filtered.slice(0, 200)) {
+        items.push({
+          label: pl.path,
+          description: `${pl.song_count} track(s)`,
+          value: pl,
+        })
+      }
+      if (filtered.length > 200) {
+        items.push({
+          label: `... ${filtered.length - 200} more — use search to narrow`,
+          value: "__search__",
+        })
+      }
+      const choice = await this.select("Select Playlist", items, { flow })
+      if (choice === "__search__") {
+        const term = (await this.input("Filter Playlists", "Substring (blank for all)", "", { flow })).trim().toLowerCase()
+        filtered = term
+          ? sortedPlaylists.filter((pl) => pl.path.toLowerCase().includes(term))
+          : sortedPlaylists
+        if (!filtered.length) {
+          await this.message("No Matches", [`No playlists matched "${term}".`], "Back", flow)
+          filtered = sortedPlaylists
+        }
+        continue
+      }
+      if (choice === "__clear__") {
+        filtered = sortedPlaylists
+        continue
+      }
+      return choice as Playlist
     }
-    return await this.select(
-      "Select Playlist",
-      matches.slice(0, 60).map((pl) => ({
-        label: pl.path,
-        description: `${pl.song_count} track(s)`,
-        value: pl,
-      })),
-      { flow },
-    )
   }
 
   private async pickTracks(
