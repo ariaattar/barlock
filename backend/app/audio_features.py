@@ -14,7 +14,7 @@ import numpy as np
 import soundfile as sf
 
 AUDIO_EXTS = {".mp3", ".wav", ".aiff", ".aif", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
-ANALYSIS_VERSION = 9
+ANALYSIS_VERSION = 10
 ENERGY_CURVE_BINS = 256
 
 NOTE_NAMES = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
@@ -537,7 +537,11 @@ def _check_tempo_stability(onset: np.ndarray, times: np.ndarray, tempo: float) -
     if inter.size == 0 or float(np.median(inter)) <= 1e-6:
         return True
     drift = float(np.std(inter) / np.median(inter))
-    return drift < 0.18
+    # 0.25 = 25% drift before we call a track tempo-variable. Real DJ edits have
+    # natural groove variation and PLP peak picking is noisy; tighter thresholds
+    # mis-flag too many constant-tempo tracks, which then halves their
+    # segmentation confidence and prevents structural cue labels.
+    return drift < 0.25
 
 
 def _pick_first_downbeat(
@@ -909,7 +913,11 @@ def _segment_sections(
     if len(middle_energies) >= 2:
         second_energy = middle_energies[1][1]
         drop_dominance = max(0.0, (drop_energy / max(second_energy, 1e-6)) - 1.0)
-    if drop_dominance >= 0.25:
+    # 0.10 = peak section needs only 10% more energy than the runner-up to count
+    # as "the drop." 0.25 was too strict for tech-house / dance edits where the
+    # peak and build sections often have similar RMS — those tracks ended up
+    # with no drop label and silently fell back to Phrase 32 on pad C.
+    if drop_dominance >= 0.10:
         labels[drop_idx] = "drop"
 
     # Breakdown: lowest energy in middle, at least 8 bars long, between intro and outro
@@ -948,10 +956,18 @@ def _segment_sections(
 
     coverage_score = 1.0 if 3 <= len(sections) <= 9 else 0.0
     snap_score = float(np.median(snap_qualities)) if snap_qualities else 0.0
-    drop_score = min(1.0, drop_dominance / 0.6)
+    # If a drop section was actually labeled, it cleared the dominance gate
+    # already. Reward that as a binary 1.0 rather than scaling against an
+    # unrealistic 0.60 ratio that most dance tracks don't reach.
+    drop_score = 1.0 if "drop" in labels else min(1.0, drop_dominance / 0.4)
     tempo_mult = 1.0 if bundle.tempo_stable else 0.5
     confidence = (0.35 * snap_score + 0.35 * drop_score + 0.20 * coverage_score + 0.10) * tempo_mult
-    mode = "structural" if confidence >= 0.65 and any(lbl == "drop" for lbl in labels) else "heuristic"
+    # Threshold tuned from real-library observations: on a 66-track sample the
+    # confidence distribution showed a natural gap at 0.5-0.6 with a tail of
+    # truly-low-confidence tracks below 0.4. 0.50 keeps the conservative
+    # behavior on noisy tracks while pulling in the long middle tail that
+    # was being unnecessarily forced into the heuristic Phrase-16/32 fallback.
+    mode = "structural" if confidence >= 0.50 and any(lbl == "drop" for lbl in labels) else "heuristic"
     return sections, confidence, mode
 
 
