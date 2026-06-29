@@ -14,8 +14,20 @@ from pyrekordbox.utils import get_rekordbox_pid
 from .audio_features import TrackFeatures
 
 REKORDBOX_DIR = Path.home() / "Library" / "Pioneer" / "rekordbox"
-AUTO_CUE_NAMES = {"Intro", "Phrase 16", "Phrase 32", "Intro Loop", "Exit Loop", "Outro"}
+AUTO_CUE_NAMES = {
+    "Intro",
+    "Phrase 16",
+    "Phrase 32",
+    "Build",
+    "Drop",
+    "Intro Loop",
+    "Exit Loop",
+    "Breakdown",
+    "Last Drop",
+    "Outro",
+}
 HOT_CUE_KINDS = (1, 2, 3, 5, 6, 7, 8, 9)
+RESERVED_EXTERNAL_SLOTS = {5, 6}  # zero-based hot cue slots only written on soundcloud-dl managed tracks
 
 
 @dataclass(frozen=True)
@@ -30,10 +42,12 @@ class PlaylistInfo:
 @dataclass(frozen=True)
 class PushResult:
     playlist_name: str
+    playlist_id: str
     added_to_collection: int
     already_in_collection: int
     added_to_playlist: int
     already_in_playlist: int
+    removed_from_playlist: int
     added_cues: int
     skipped_cues: int
     added_loops: int
@@ -121,10 +135,11 @@ def push_tracks_to_playlist(
     playlist_name: str,
     create_playlist: bool,
     playlist_id: str | None = None,
+    remove_paths: list[str] | None = None,
 ) -> PushResult:
     if rekordbox_running():
         raise RuntimeError("Close Rekordbox before direct playlist push.")
-    if not features:
+    if not features and not remove_paths:
         raise ValueError("no tracks to push")
 
     backup_dir = backup_rekordbox()
@@ -133,6 +148,7 @@ def push_tracks_to_playlist(
     existing_collection = 0
     added_playlist = 0
     existing_playlist = 0
+    removed_playlist = 0
     added_cues = 0
     skipped_cues = 0
     added_loops = 0
@@ -152,6 +168,14 @@ def push_tracks_to_playlist(
             for song in db.get_playlist_songs(PlaylistID=playlist.ID).all()
         }
 
+        if remove_paths:
+            removed_playlist = _remove_paths_from_playlist(db, playlist, remove_paths)
+            _safe_flush(db)
+            existing_playlist_ids = {
+                str(song.ContentID)
+                for song in db.get_playlist_songs(PlaylistID=playlist.ID).all()
+            }
+
         for item in features:
             content, created = _ensure_content(db, item)
             if created:
@@ -159,25 +183,30 @@ def push_tracks_to_playlist(
             else:
                 existing_collection += 1
             _apply_metadata(db, content, item)
+            _safe_flush(db)
             cue_added, cue_skipped, loop_added, loop_skipped = _sync_cue_hints(db, content, item)
             added_cues += cue_added
             skipped_cues += cue_skipped
             added_loops += loop_added
             skipped_loops += loop_skipped
+            _safe_flush(db)
             if str(content.ID) in existing_playlist_ids:
                 existing_playlist += 1
                 continue
             db.add_to_playlist(playlist, content)
             existing_playlist_ids.add(str(content.ID))
             added_playlist += 1
+            _safe_flush(db)
 
         db.commit()
         return PushResult(
             playlist_name=playlist.Name,
+            playlist_id=str(playlist.ID),
             added_to_collection=added_collection,
             already_in_collection=existing_collection,
             added_to_playlist=added_playlist,
             already_in_playlist=existing_playlist,
+            removed_from_playlist=removed_playlist,
             added_cues=added_cues,
             skipped_cues=skipped_cues,
             added_loops=added_loops,
@@ -189,6 +218,22 @@ def push_tracks_to_playlist(
         raise
     finally:
         db.close()
+
+
+def _remove_paths_from_playlist(db: Rekordbox6Database, playlist, remove_paths: list[str]) -> int:
+    targets = {str(Path(p).resolve()) for p in remove_paths if p}
+    if not targets:
+        return 0
+    removed = 0
+    for song in list(db.get_playlist_songs(PlaylistID=playlist.ID).all()):
+        content = song.Content
+        if content is None:
+            continue
+        path = str(content.FolderPath) if content.FolderPath else ""
+        if path in targets:
+            db.delete(song)
+            removed += 1
+    return removed
 
 
 def write_m3u(features: list[TrackFeatures], out_path: Path) -> Path:
@@ -301,7 +346,8 @@ def _apply_metadata(db: Rekordbox6Database, content, item: TrackFeatures) -> Non
 def _sync_cue_hints(db: Rekordbox6Database, content, item: TrackFeatures) -> tuple[int, int, int, int]:
     existing = list(db.get_cue(ContentID=content.ID).all())
     removed_cues = 0
-    if _is_soundcloud_dl_content(content):
+    is_managed = _is_soundcloud_dl_content(content)
+    if is_managed:
         existing, removed_cues = _remove_generated_cues(db, existing)
     existing_hotcue_kinds = {int(cue.Kind) for cue in existing if cue.Kind and int(cue.Kind) > 0}
     existing_memory_ms = [
@@ -322,6 +368,11 @@ def _sync_cue_hints(db: Rekordbox6Database, content, item: TrackFeatures) -> tup
                 skipped_loops += 1
             else:
                 skipped_cues += 1
+            continue
+        # Slots 5 and 6 (Breakdown / Last Drop) are only written on soundcloud-dl-managed tracks
+        # so we never overwrite a user's manually-placed pads on external tracks.
+        if hint.hotcue_slot in RESERVED_EXTERNAL_SLOTS and not is_managed:
+            skipped_cues += 1
             continue
         in_msec = max(0, int(round(hint.seconds * 1000.0)))
         if kind > 0 and kind in existing_hotcue_kinds:
@@ -386,7 +437,23 @@ def _remove_generated_cues(db: Rekordbox6Database, existing: list) -> tuple[list
             removed += 1
         else:
             kept.append(cue)
+    if removed:
+        # Flush deletes before any inserts. Legacy Rekordbox rows can store ID columns
+        # as int while we write str — sqlalchemy's _sort_states cannot sort a mixed-type
+        # pending set, so we keep each flush group homogeneous.
+        _safe_flush(db)
     return kept, removed
+
+
+def _safe_flush(db) -> None:
+    flush = getattr(db, "flush", None)
+    if not callable(flush):
+        return
+    try:
+        flush()
+    except Exception:
+        # The session may be a test fake without a real flush; ignore.
+        pass
 
 
 def _is_soundcloud_dl_content(content) -> bool:
@@ -430,7 +497,19 @@ def _comment(item: TrackFeatures) -> str:
         parts.append(f"{item.camelot_key or item.musical_key}")
     if item.energy:
         parts.append(f"energy {item.energy}/10")
+    if item.vocal_class and item.vocal_class != "unknown":
+        parts.append(item.vocal_class)
+    drop = next((cue for cue in item.cue_hints if cue.name == "Drop"), None)
+    if drop is not None:
+        parts.append(f"drop @ {_format_mmss(drop.seconds)}")
+    if not item.tempo_stable:
+        parts.append("tempo: variable")
     return " | ".join(parts)
+
+
+def _format_mmss(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
 def _kind_for_suffix(suffix: str) -> str:

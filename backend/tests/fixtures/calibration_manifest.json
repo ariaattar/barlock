@@ -1,0 +1,12 @@
+[
+  {
+    "path": "~/Music/refs/example-track.mp3",
+    "expected": {
+      "bpm": 124,
+      "first_downbeat_sec": 0.48,
+      "drop_sec": 134.5,
+      "vocal_class": "dub",
+      "segmentation_mode": "structural"
+    }
+  }
+]

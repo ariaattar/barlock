@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import re
 import shutil
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any
 
-from .audio_features import CueHint, TrackFeatures
+from .audio_features import CueHint, Section, TrackFeatures, VocalInterval
 
 
 def resolve_download_path(value: str, default: Path) -> Path:
@@ -43,6 +43,8 @@ def safe_slug(value: str) -> str:
 def features_to_dict(features: TrackFeatures) -> dict[str, Any]:
     data = asdict(features)
     data["cue_hints"] = [asdict(cue) for cue in features.cue_hints]
+    data["sections"] = [asdict(s) for s in features.sections]
+    data["vocals"] = [asdict(v) for v in features.vocals]
     return data
 
 
@@ -58,6 +60,10 @@ def features_from_dict(data: dict[str, Any]) -> TrackFeatures:
         cue_hints.append(CueHint(**cue_data))
     copied["cue_hints"] = cue_hints
     copied["analysis_version"] = int(copied.get("analysis_version", 0) or 0)
+    copied["sections"] = [Section(**s) for s in copied.get("sections", [])]
+    copied["vocals"] = [VocalInterval(**v) for v in copied.get("vocals", [])]
+    valid = {f.name for f in fields(TrackFeatures)}
+    copied = {k: v for k, v in copied.items() if k in valid}
     return TrackFeatures(**copied)
 
 

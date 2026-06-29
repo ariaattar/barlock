@@ -7,16 +7,22 @@ import numpy as np
 from app.audio_features import (
     CueHint,
     LoopProfile,
+    Section,
     TrackFeatures,
+    VocalInterval,
     _best_exit_loop_candidate,
     _best_intro_loop_candidate,
+    _build_energy_curve,
+    _classify_vocal,
     _cue_hints,
-    _cue_layout_is_current,
-    _ensure_current_cue_hints,
     _exit_entry_transient_penalty,
+    _heuristic_drop_breakdown,
     _loop_candidate_score,
+    _select_loop_candidate,
+    _snap_loop_end_to_beat,
     _source_id_from_filename,
     _title_artist_from_filename,
+    _vocal_overlap_fraction,
     camelot_key,
 )
 
@@ -37,7 +43,7 @@ def test_filename_metadata_parsing_with_soundcloud_id():
     assert _source_id_from_filename(path) == "2256704372"
 
 
-def test_auto_cue_hints_include_landmarks_without_audio_profile():
+def test_heuristic_cue_layout_uses_phrase_landmarks():
     cues = _cue_hints(duration=240.0, bpm=120.0, first_downbeat=0.5)
 
     by_name = {cue.name: cue for cue in cues}
@@ -49,6 +55,56 @@ def test_auto_cue_hints_include_landmarks_without_audio_profile():
     assert by_name["Outro"].kind == "memory"
     assert "Intro Loop" not in by_name
     assert "Exit Loop" not in by_name
+
+
+def test_structural_cue_layout_uses_section_labels():
+    sections = [
+        Section(start_sec=0.0, end_sec=32.0, label="intro", confidence=0.9),
+        Section(start_sec=32.0, end_sec=64.0, label="build", confidence=0.9),
+        Section(start_sec=64.0, end_sec=128.0, label="drop", confidence=0.9),
+        Section(start_sec=128.0, end_sec=160.0, label="breakdown", confidence=0.9),
+        Section(start_sec=160.0, end_sec=192.0, label="last_drop", confidence=0.9),
+        Section(start_sec=192.0, end_sec=240.0, label="outro", confidence=0.9),
+    ]
+
+    cues = _cue_hints(
+        duration=240.0,
+        bpm=120.0,
+        first_downbeat=0.5,
+        sections=sections,
+        segmentation_mode="structural",
+    )
+
+    by_name = {cue.name: cue for cue in cues}
+    # Pad C is always the drop slot — name changes between modes but slot is stable.
+    assert by_name["Drop"].hotcue_slot == 2
+    assert by_name["Build"].hotcue_slot == 1
+    assert by_name["Breakdown"].hotcue_slot == 5
+    assert by_name["Last Drop"].hotcue_slot == 6
+    assert by_name["Outro"].kind == "memory"
+    assert by_name["Outro"].seconds == 192.0
+
+
+def test_pad_c_is_drop_slot_in_both_modes():
+    heuristic = _cue_hints(duration=240.0, bpm=120.0, first_downbeat=0.5)
+    sections = [
+        Section(start_sec=0.0, end_sec=32.0, label="intro", confidence=0.9),
+        Section(start_sec=32.0, end_sec=96.0, label="drop", confidence=0.9),
+        Section(start_sec=96.0, end_sec=240.0, label="outro", confidence=0.9),
+    ]
+    structural = _cue_hints(
+        duration=240.0,
+        bpm=120.0,
+        first_downbeat=0.5,
+        sections=sections,
+        segmentation_mode="structural",
+    )
+    heur_pad_c = next(c for c in heuristic if c.hotcue_slot == 2)
+    struct_pad_c = next(c for c in structural if c.hotcue_slot == 2)
+    assert heur_pad_c.name == "Phrase 32"
+    assert struct_pad_c.name == "Drop"
+    assert heur_pad_c.kind == "hot"
+    assert struct_pad_c.kind == "hot"
 
 
 def test_auto_cue_hints_write_scored_intro_and_exit_loops():
@@ -167,61 +223,143 @@ def test_loop_candidate_rejects_final_bar_fill():
     assert score is None
 
 
-def test_cached_features_without_loops_are_upgraded():
-    features = TrackFeatures(
-        path="/tmp/test.mp3",
-        title="Test",
-        artist="Artist",
-        duration_sec=240.0,
-        sample_rate=44100,
-        bpm=120.0,
-        musical_key="Dm",
-        camelot_key="7A",
-        key_confidence=0.8,
-        loudness_dbfs=-10.0,
-        peak_dbfs=-0.1,
-        energy=8,
-        first_downbeat_sec=0.5,
-        cue_hints=[CueHint("Intro", 0.5, "hot", 0)],
+def test_intro_loop_rejects_high_confidence_vocal_overlap():
+    duration = 120.0
+    times = np.linspace(0.0, duration, 241)
+    rms = np.full(times.shape, 0.04)
+    rms[(times >= 24.0) & (times <= 96.0)] = 0.75
+    vocals = (VocalInterval(start_sec=28.0, end_sec=50.0, confidence=0.95),)
+    profile = LoopProfile(
+        offset_sec=0.0,
+        sample_rate=10,
+        y=np.zeros(int(duration * 10)),
+        rms_times=times,
+        rms=rms,
+        feature_times=times,
+        onset=np.full(times.shape, 0.6),
+        vocals=vocals,
     )
 
-    upgraded = _ensure_current_cue_hints(features)
-
-    assert not any(cue.kind == "loop" for cue in upgraded.cue_hints)
-    assert _cue_layout_is_current(upgraded.cue_hints)
-
-
-def test_cached_features_with_old_loop_layout_are_upgraded():
-    features = TrackFeatures(
-        path="/tmp/test.mp3",
-        title="Test",
-        artist="Artist",
-        duration_sec=240.0,
-        sample_rate=44100,
-        bpm=120.0,
-        musical_key="Dm",
-        camelot_key="7A",
-        key_confidence=0.8,
-        loudness_dbfs=-10.0,
-        peak_dbfs=-0.1,
-        energy=8,
-        first_downbeat_sec=0.5,
-        cue_hints=[
-            CueHint("Intro", 0.5, "hot", 0),
-            CueHint("Intro Loop", 0.5, "loop", 1, 32.5, 16),
-            CueHint("Phrase 32", 64.5, "hot", 2),
-            CueHint("Exit Loop", 198.5, "loop", 3, 230.5, 16),
-            CueHint("Outro", 176.0, "memory", None),
-        ],
+    candidate = _best_intro_loop_candidate(
+        duration=duration,
+        bar=2.0,
+        first_downbeat=0.5,
+        loop_profile=profile,
     )
 
-    upgraded = _ensure_current_cue_hints(features)
+    # If a candidate is still chosen, it must not overlap the vocal interval by more than 25%.
+    if candidate is not None:
+        start, end, _ = candidate
+        overlap = max(0.0, min(end, 50.0) - max(start, 28.0))
+        assert overlap / max(end - start, 1e-6) <= 0.25
 
-    assert _cue_layout_is_current(upgraded.cue_hints)
-    by_name = {cue.name: cue for cue in upgraded.cue_hints}
-    assert by_name["Phrase 16"].hotcue_slot == 1
-    assert "Intro Loop" not in by_name
-    assert "Exit Loop" not in by_name
+
+def test_vocal_overlap_fraction_respects_min_confidence():
+    vocals = [
+        VocalInterval(start_sec=10.0, end_sec=20.0, confidence=0.4),
+        VocalInterval(start_sec=30.0, end_sec=34.0, confidence=0.9),
+    ]
+    assert _vocal_overlap_fraction(vocals, 10.0, 20.0, min_confidence=0.6) == 0.0
+    assert _vocal_overlap_fraction(vocals, 30.0, 34.0, min_confidence=0.6) == 1.0
+
+
+def test_vocal_classification_thresholds():
+    assert _classify_vocal(0.0) == "unknown"
+    assert _classify_vocal(0.03) == "instrumental"
+    assert _classify_vocal(0.10) == "dub"
+    assert _classify_vocal(0.40) == "vocal"
+
+
+def test_loop_end_snap_pulls_to_nearest_beat_within_window():
+    bts = np.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0])
+    profile = LoopProfile(
+        offset_sec=0.0,
+        sample_rate=10,
+        y=np.zeros(60),
+        rms_times=np.linspace(0.0, 5.0, 11),
+        rms=np.full(11, 0.7),
+        beat_times=bts,
+    )
+
+    start, end, beats = _snap_loop_end_to_beat(0.0, 4.03, 8, profile, bar=2.0)
+    assert end == 4.0
+    start, end, beats = _snap_loop_end_to_beat(0.0, 4.20, 8, profile, bar=2.0)
+    assert end == 4.20
+
+
+def test_energy_curve_has_fixed_length_and_unit_range():
+    from app.audio_features import _FeatureBundle
+
+    sr = 22050
+    duration = 64.0
+    times = np.linspace(0.0, duration, 256)
+    rms = np.concatenate([np.full(85, 0.05), np.full(86, 0.5), np.full(85, 0.05)])
+    rms = rms[: times.size]
+    onset = np.maximum(rms - 0.05, 0.0)
+    bundle = _FeatureBundle(
+        y=np.zeros(int(sr * duration)),
+        sr=sr,
+        duration_full=duration,
+        duration_analysis=duration,
+        hop=512,
+        times=times,
+        rms=rms,
+        onset=onset,
+        chroma=np.zeros((12, times.size)),
+        centroid=np.zeros(times.size),
+        bandwidth=np.zeros(times.size),
+        tempo=120.0,
+        beat_times=np.arange(0.0, duration, 0.5),
+        bpm_alternates=[],
+        tempo_stable=True,
+        first_downbeat=0.0,
+        beat_phase_confidence=1.0,
+    )
+
+    curve = _build_energy_curve(bundle)
+    assert len(curve) == 256
+    assert all(0.0 <= v <= 1.0 for v in curve)
+    # The middle third should be brighter than the outer thirds for this synthetic signal.
+    first_third = float(np.mean(curve[: 256 // 3]))
+    middle = float(np.mean(curve[256 // 3 : (2 * 256) // 3]))
+    last_third = float(np.mean(curve[(2 * 256) // 3 :]))
+    assert middle > first_third
+    assert middle > last_third
+
+
+def test_heuristic_drop_breakdown_thresholds():
+    duration = 200.0
+    curve = [0.2] * 256
+    for idx in range(80, 110):
+        curve[idx] = 0.9
+    for idx in range(180, 200):
+        curve[idx] = 0.1
+
+    breakdown_sec, drop_sec = _heuristic_drop_breakdown(
+        duration=duration,
+        bar=2.0,
+        first_downbeat=0.0,
+        energy_curve=curve,
+    )
+
+    assert drop_sec is not None
+    assert 60.0 <= drop_sec <= 90.0
+    assert breakdown_sec is None or breakdown_sec >= 48.0
+
+
+def test_plateau_select_prefers_robust_candidate_over_spike():
+    candidates = [
+        (20.0, 24.0, 8, 0.84),
+        (20.0 + 0.5, 24.5, 8, 0.85),
+        (20.0 + 1.0, 25.0, 8, 0.83),
+        (40.0, 44.0, 8, 0.86),
+        (40.5, 44.5, 8, 0.60),
+        (41.0, 45.0, 8, 0.61),
+    ]
+    chosen = _select_loop_candidate(candidates)
+    assert chosen is not None
+    # The plateau cluster around t=20 wins despite the spike's slightly higher peak at t=40.
+    assert 19.5 <= chosen[0] <= 21.5
 
 
 def _profile_from_rms(duration: float, times: np.ndarray, rms: np.ndarray) -> LoopProfile:

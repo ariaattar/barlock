@@ -199,6 +199,156 @@ def test_rekordbox_xml_writes_loop_marks(tmp_path):
     assert mark.attrib["Num"] == "3"
 
 
+def test_reserved_slots_only_written_on_managed_tracks():
+    from app.rekordbox_sync import RESERVED_EXTERNAL_SLOTS
+
+    db = FakeDb()
+    content = SimpleNamespace(ID="track-1", UUID="uuid-1", HotCueAutoLoad=None, CueUpdated=None, Commnt="user notes")
+    features = _features(
+        [
+            CueHint("Intro", 0.5, "hot", 0),
+            CueHint("Breakdown", 80.0, "hot", 5),
+            CueHint("Last Drop", 120.0, "hot", 6),
+        ]
+    )
+
+    added, _, _, _ = _sync_cue_hints(db, content, features)
+
+    assert added == 1
+    written_slots = {cue.Kind for cue in db.added}
+    # Only Intro (kind 1, slot 0) is written. Reserved slots 5/6 stay untouched.
+    assert written_slots == {1}
+    assert 5 in RESERVED_EXTERNAL_SLOTS and 6 in RESERVED_EXTERNAL_SLOTS
+
+
+def test_reserved_slots_written_on_soundcloud_dl_managed_tracks():
+    db = FakeDb()
+    content = SimpleNamespace(
+        ID="track-1",
+        UUID="uuid-1",
+        HotCueAutoLoad=None,
+        CueUpdated=None,
+        Commnt="soundcloud-dl | https://soundcloud.com/x/y",
+    )
+    features = _features(
+        [
+            CueHint("Intro", 0.5, "hot", 0),
+            CueHint("Breakdown", 80.0, "hot", 5),
+            CueHint("Last Drop", 120.0, "hot", 6),
+        ]
+    )
+
+    added, _, _, _ = _sync_cue_hints(db, content, features)
+
+    assert added == 3
+    written_kinds = [cue.Kind for cue in db.added]
+    assert written_kinds == [1, 7, 8]  # slot 5 -> kind 7, slot 6 -> kind 8
+
+
+def test_auto_cue_names_includes_every_emitted_cue_name():
+    from app.audio_features import _cue_hints, Section
+    from app.rekordbox_sync import AUTO_CUE_NAMES
+
+    heuristic = {cue.name for cue in _cue_hints(duration=240.0, bpm=120.0, first_downbeat=0.5)}
+    structural_sections = [
+        Section(0.0, 32.0, "intro", 0.9),
+        Section(32.0, 64.0, "build", 0.9),
+        Section(64.0, 128.0, "drop", 0.9),
+        Section(128.0, 160.0, "breakdown", 0.9),
+        Section(160.0, 192.0, "last_drop", 0.9),
+        Section(192.0, 240.0, "outro", 0.9),
+    ]
+    structural = {
+        cue.name
+        for cue in _cue_hints(
+            duration=240.0,
+            bpm=120.0,
+            first_downbeat=0.5,
+            sections=structural_sections,
+            segmentation_mode="structural",
+        )
+    }
+    # Loops only emit when a profile is present; that's fine — name allowlist must still cover them.
+    emitted = heuristic | structural | {"Intro Loop", "Exit Loop"}
+    missing = emitted - AUTO_CUE_NAMES
+    assert not missing, f"missing names from AUTO_CUE_NAMES: {missing}"
+
+
+def test_resync_is_idempotent_no_changes_on_second_push():
+    content = SimpleNamespace(
+        ID="track-1",
+        UUID="uuid-1",
+        HotCueAutoLoad=None,
+        CueUpdated=None,
+        Commnt="soundcloud-dl | https://soundcloud.com/x/y",
+    )
+    features = _features(
+        [
+            CueHint("Intro", 0.5, "hot", 0),
+            CueHint("Phrase 16", 30.0, "hot", 1),
+            CueHint("Phrase 32", 60.0, "hot", 2),
+            CueHint("Intro Loop", 0.5, "loop", 3, 4.5, 8),
+            CueHint("Exit Loop", 180.0, "loop", 4, 184.0, 8),
+            CueHint("Outro", 200.0, "memory", None),
+        ]
+    )
+
+    # First push from an empty DB.
+    db = FakeDb()
+    first_added, _, first_added_loops, _ = _sync_cue_hints(db, content, features)
+    assert first_added + first_added_loops == 6
+
+    # Build "existing" state that mirrors what the first push wrote.
+    existing = [
+        SimpleNamespace(Kind=cue.Kind, InMsec=cue.InMsec, Comment=cue.Comment, OutMsec=cue.OutMsec)
+        for cue in db.added
+    ]
+    db2 = FakeDb(existing)
+    added, _skipped, added_loops, _skipped_loops = _sync_cue_hints(db2, content, features)
+
+    # Re-push removes the previously-generated cues (managed track) then re-writes them, so
+    # net adds equal the cue count and there are no duplicate (Kind, InMsec) pairs in the DB.
+    final_state = [
+        (cue.Kind, cue.InMsec)
+        for cue in (existing + db2.added)
+        if cue not in db2.deleted
+    ]
+    assert len(final_state) == len(set(final_state)), f"duplicate cues after re-push: {final_state}"
+    assert added + added_loops == 6
+
+
+def test_comment_includes_structure_summary_and_vocal_class():
+    from app.rekordbox_sync import _comment
+
+    features = TrackFeatures(
+        path="/tmp/test.mp3",
+        title="Track",
+        artist="Artist",
+        duration_sec=240.0,
+        sample_rate=44100,
+        bpm=124.0,
+        musical_key="Am",
+        camelot_key="8A",
+        key_confidence=0.9,
+        loudness_dbfs=-9.0,
+        peak_dbfs=-0.1,
+        energy=8,
+        first_downbeat_sec=0.5,
+        cue_hints=[
+            CueHint("Intro", 0.5, "hot", 0),
+            CueHint("Drop", 134.5, "hot", 2),
+        ],
+        source_url="https://soundcloud.com/x/y",
+        vocal_class="dub",
+        tempo_stable=True,
+    )
+
+    comment = _comment(features)
+    assert "drop @ 2:14" in comment
+    assert "dub" in comment
+    assert "8A" in comment
+
+
 def _features(cues):
     return TrackFeatures(
         path="/tmp/test.mp3",
