@@ -68,6 +68,8 @@ Start the interactive terminal UI:
 soundcloud-dl
 ```
 
+Interactive menus support arrow keys, Enter to select, `b` to go back, and `q` to quit where available.
+
 Typical flow:
 
 1. Choose `Download SoundCloud URL or playlist`.

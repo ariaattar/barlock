@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import datetime as dt
 import shutil
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +43,29 @@ class PushResult:
 
 def rekordbox_running() -> bool:
     return bool(get_rekordbox_pid())
+
+
+def close_rekordbox(*, timeout_sec: float = 20.0) -> bool:
+    if not rekordbox_running():
+        return True
+
+    try:
+        subprocess.run(
+            ["osascript", "-e", 'tell application "rekordbox" to quit'],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if not rekordbox_running():
+            return True
+        time.sleep(0.5)
+    return not rekordbox_running()
 
 
 def backup_rekordbox() -> Path:

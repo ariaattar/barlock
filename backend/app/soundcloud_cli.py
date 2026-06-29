@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import argparse
 import re
+import select
 import shutil
 import sys
+import termios
+import time
+import tty
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,12 +15,13 @@ from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.prompt import Prompt
 from rich.table import Table
 
 from .audio_features import TrackFeatures, analyze_file, audio_files, write_id3_tags
 from .rekordbox_sync import (
     PlaylistInfo,
+    close_rekordbox,
     doctor,
     list_playlists,
     push_tracks_to_playlist,
@@ -38,6 +43,11 @@ from .soundcloud_downloader import (
 )
 
 console = Console()
+BACK_VALUES = {"b", "back", "<"}
+
+
+class BackRequested(Exception):
+    pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -118,36 +128,26 @@ class TerminalApp:
 
     def run(self) -> int:
         while True:
-            self._header()
-            table = Table(box=box.SIMPLE, show_header=False)
-            table.add_column("Key", style="cyan", width=4)
-            table.add_column("Action")
-            table.add_row("1", "Download SoundCloud URL or playlist")
-            table.add_row("2", f"Sync likes for @{self.config.soundcloud_username}")
-            table.add_row("3", "Analyze/tag local download folder")
-            table.add_row("4", "Push analyzed tracks to Rekordbox playlist")
-            table.add_row("5", "Rekordbox doctor")
-            table.add_row("6", "Settings")
-            table.add_row("q", "Quit")
-            console.print(table)
-
-            choice = Prompt.ask("Choose", default="1").strip().lower()
+            choice = self._main_menu_choice()
             if choice in {"q", "quit", "exit"}:
                 return 0
-            if choice == "1":
-                self.download_urls_flow()
-            elif choice == "2":
-                self.sync_likes()
-            elif choice == "3":
-                self.analyze_folder(None, write_tags=None)
-            elif choice == "4":
-                self.push_folder_flow()
-            elif choice == "5":
-                self.run_doctor()
-            elif choice == "6":
-                self.settings_flow()
-            else:
-                console.print("[red]Unknown choice[/red]")
+            try:
+                if choice == "1":
+                    self.download_urls_flow()
+                elif choice == "2":
+                    self.sync_likes()
+                elif choice == "3":
+                    self.analyze_folder(None, write_tags=None)
+                elif choice == "4":
+                    self.push_folder_flow()
+                elif choice == "5":
+                    self.run_doctor()
+                elif choice == "6":
+                    self.settings_flow()
+                else:
+                    console.print("[red]Unknown choice[/red]")
+            except BackRequested:
+                console.print("[cyan]Back[/cyan]")
 
     def download_urls_flow(self) -> int:
         urls = self._prompt_urls()
@@ -193,12 +193,12 @@ class TerminalApp:
         console.print(f"Found [cyan]{len(files)}[/cyan] audio file(s)")
         features = self._analyze_files(files)
         if write_tags is None and prompt_options:
-            write_tags = Confirm.ask("Write BPM/key/title tags to MP3 files?", default=self.config.write_tags)
+            write_tags = self._prompt_confirm("Write BPM/key/title tags to MP3 files?", default=self.config.write_tags)
         if write_tags:
             self._write_tags(features)
-        if prompt_options and Confirm.ask("Generate Rekordbox import files?", default=self.config.create_import_files):
+        if prompt_options and self._prompt_confirm("Generate Rekordbox import files?", default=self.config.create_import_files):
             self._write_import_files(features, target, source_name=target.name)
-        if prompt_options and Confirm.ask("Push these tracks to a Rekordbox playlist?", default=False):
+        if prompt_options and self._prompt_confirm("Push these tracks to a Rekordbox playlist?", default=False):
             self._push_features(features, default_playlist_name=target.name, output_dir=target)
         return 0
 
@@ -229,29 +229,29 @@ class TerminalApp:
 
     def settings_flow(self) -> int:
         self._header("Settings")
-        self.config.soundcloud_username = Prompt.ask(
+        self.config.soundcloud_username = self._prompt_text(
             "SoundCloud username",
             default=self.config.soundcloud_username,
         ).strip()
         output_dir = self._prompt_path("Default output folder", self.config.output_path)
         update_output_paths(self.config, output_dir)
-        self.config.workers = IntPrompt.ask("Parallel track downloads", default=self.config.workers)
-        self.config.fragments = IntPrompt.ask("Parallel fragments per track", default=self.config.fragments)
-        self.config.quality = Prompt.ask("MP3 bitrate", default=self.config.quality)
-        self.config.rekordbox_playlist = Prompt.ask(
+        self.config.workers = self._prompt_int("Parallel track downloads", default=self.config.workers)
+        self.config.fragments = self._prompt_int("Parallel fragments per track", default=self.config.fragments)
+        self.config.quality = self._prompt_text("MP3 bitrate", default=self.config.quality)
+        self.config.rekordbox_playlist = self._prompt_text(
             "Default Rekordbox playlist",
             default=self.config.rekordbox_playlist,
         )
-        self.config.analyze_after_download = Confirm.ask(
+        self.config.analyze_after_download = self._prompt_confirm(
             "Analyze after download by default?",
             default=self.config.analyze_after_download,
         )
-        self.config.write_tags = Confirm.ask("Write tags by default?", default=self.config.write_tags)
-        self.config.create_import_files = Confirm.ask(
+        self.config.write_tags = self._prompt_confirm("Write tags by default?", default=self.config.write_tags)
+        self.config.create_import_files = self._prompt_confirm(
             "Generate M3U/XML import files by default?",
             default=self.config.create_import_files,
         )
-        self.config.direct_rekordbox_push = Confirm.ask(
+        self.config.direct_rekordbox_push = self._prompt_confirm(
             "Offer direct Rekordbox playlist push by default?",
             default=self.config.direct_rekordbox_push,
         )
@@ -273,10 +273,7 @@ class TerminalApp:
         prompt_options: bool = True,
     ) -> int:
         if prompt_options:
-            output_dir = self._prompt_path("Output folder", self.config.output_path)
-            workers = IntPrompt.ask("Parallel track downloads", default=self.config.workers)
-            fragments = IntPrompt.ask("Parallel fragments per track", default=self.config.fragments)
-            quality = Prompt.ask("MP3 bitrate", default=self.config.quality)
+            output_dir, workers, fragments, quality = self._prompt_download_options()
         else:
             output_dir = self.config.output_path
             workers = self.config.workers
@@ -293,9 +290,9 @@ class TerminalApp:
         source_name = plan.title or source_name
         archive = archive or _archive_for_output(output_dir, source_name)
         self._print_entries(entries)
-        if dry_run or (prompt_options and Confirm.ask("Dry run only?", default=False)):
+        if dry_run or (prompt_options and self._prompt_confirm("Dry run only?", default=False)):
             return 0
-        if prompt_options and not Confirm.ask(f"Download {len(entries)} track(s) to {output_dir}?", default=True):
+        if prompt_options and not self._prompt_confirm(f"Download {len(entries)} track(s) to {output_dir}?", default=True):
             return 0
 
         results = download_entries(
@@ -323,28 +320,28 @@ class TerminalApp:
 
         features: list[TrackFeatures] = []
         should_analyze = analyze if analyze is not None else (
-            Confirm.ask("Analyze BPM/key/energy now?", default=self.config.analyze_after_download)
+            self._prompt_confirm("Analyze BPM/key/energy now?", default=self.config.analyze_after_download)
             if prompt_options
             else self.config.analyze_after_download
         )
         if should_analyze:
             features = self._analyze_files(paths, entries=entries, output_dir=output_dir)
         should_write_tags = write_tags if write_tags is not None else (
-            Confirm.ask("Write ID3 tags?", default=self.config.write_tags)
+            self._prompt_confirm("Write ID3 tags?", default=self.config.write_tags)
             if prompt_options
             else self.config.write_tags
         )
         if features and should_write_tags:
             self._write_tags(features)
         should_import_files = (
-            Confirm.ask("Generate Rekordbox M3U/XML import files?", default=self.config.create_import_files)
+            self._prompt_confirm("Generate Rekordbox M3U/XML import files?", default=self.config.create_import_files)
             if prompt_options
             else self.config.create_import_files
         )
         if features and should_import_files:
             self._write_import_files(features, output_dir, source_name=source_name)
         should_push = rekordbox if rekordbox is not None else (
-            Confirm.ask(
+            self._prompt_confirm(
                 "Push directly to a Rekordbox playlist?",
                 default=self.config.direct_rekordbox_push,
             )
@@ -355,6 +352,25 @@ class TerminalApp:
             self._push_features(features, default_playlist_name=source_name, output_dir=output_dir)
         return 0
 
+    def _main_menu_choice(self) -> str:
+        return str(
+            self._select_option(
+                "Choose",
+                [
+                    ("Download SoundCloud URL or playlist", "1"),
+                    (f"Sync likes for @{self.config.soundcloud_username}", "2"),
+                    ("Analyze/tag local download folder", "3"),
+                    ("Push analyzed tracks to Rekordbox playlist", "4"),
+                    ("Rekordbox doctor", "5"),
+                    ("Settings", "6"),
+                    ("Quit", "q"),
+                ],
+                allow_back=False,
+                allow_quit=True,
+                header_title="SoundCloud DL",
+            )
+        )
+
     def _push_features(
         self,
         features: list[TrackFeatures],
@@ -364,16 +380,30 @@ class TerminalApp:
     ) -> None:
         if rekordbox_running():
             console.print("[yellow]Rekordbox is open. Close it before direct DB push.[/yellow]")
-            if Confirm.ask("Generate import files instead?", default=True):
-                self._write_import_files(
-                    features,
-                    output_dir or self.config.output_path,
-                    source_name=default_playlist_name or "SoundCloud",
-                )
-            return
+            if self._prompt_confirm("Close Rekordbox now and continue?", default=True):
+                with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+                    task = progress.add_task("Closing Rekordbox...", total=None)
+                    closed = close_rekordbox()
+                    progress.remove_task(task)
+                if closed:
+                    console.print("[green]Rekordbox closed[/green]")
+                else:
+                    console.print("[yellow]Could not close Rekordbox automatically.[/yellow]")
+            if rekordbox_running():
+                if self._prompt_confirm("Wait while you close Rekordbox manually?", default=True):
+                    if self._wait_for_rekordbox_close():
+                        console.print("[green]Rekordbox closed[/green]")
+                if rekordbox_running():
+                    if self._prompt_confirm("Generate import files instead?", default=True):
+                        self._write_import_files(
+                            features,
+                            output_dir or self.config.output_path,
+                            source_name=default_playlist_name or "SoundCloud",
+                        )
+                    return
 
         playlist_name, create, playlist_id = self._choose_playlist(default_playlist_name)
-        if not Confirm.ask(f"Push {len(features)} track(s) to '{playlist_name}'?", default=True):
+        if not self._prompt_confirm(f"Push {len(features)} track(s) to '{playlist_name}'?", default=True):
             return
         result = push_tracks_to_playlist(
             features,
@@ -398,22 +428,26 @@ class TerminalApp:
 
     def _choose_playlist(self, default_playlist_name: str | None = None) -> tuple[str, bool, str | None]:
         default_name = (default_playlist_name or self.config.rekordbox_playlist).strip() or self.config.rekordbox_playlist
-        console.print("1. Use existing playlist")
-        console.print("2. Create new playlist")
-        choice = Prompt.ask("Destination", choices=["1", "2"], default="1")
-        if choice == "2":
-            return Prompt.ask("New playlist name", default=default_name), True, None
+        choice = self._select_option(
+            "Destination",
+            [("Use existing playlist", "existing"), ("Create new playlist", "create")],
+            default_index=0,
+        )
+        if choice == "create":
+            return self._prompt_text("New playlist name", default=default_name), True, None
 
         playlists = [pl for pl in list_playlists() if not pl.is_folder]
-        search = Prompt.ask("Search existing playlists", default=default_name).strip().lower()
+        search = self._prompt_text("Search existing playlists", default=default_name).strip().lower()
         matches = [pl for pl in playlists if search in pl.path.lower()] if search else playlists
         if not matches:
             console.print("[yellow]No matching playlists. Creating a new one instead.[/yellow]")
-            return Prompt.ask("New playlist name", default=default_name), True, None
-        self._print_playlists(matches[:20])
-        index = IntPrompt.ask("Select playlist number", default=1)
-        index = max(1, min(index, len(matches[:20])))
-        selected = matches[index - 1]
+            return self._prompt_text("New playlist name", default=default_name), True, None
+        selected = self._select_option(
+            "Select playlist",
+            [(f"{playlist.path} ({playlist.song_count})", playlist) for playlist in matches[:20]],
+            default_index=0,
+        )
+        assert isinstance(selected, PlaylistInfo)
         return selected.name, False, selected.id
 
     def _analyze_files(
@@ -458,18 +492,204 @@ class TerminalApp:
         console.print(f"[green]Wrote[/green] {m3u}")
         console.print(f"[green]Wrote[/green] {xml}")
 
+    def _prompt_download_options(self) -> tuple[Path, int, int, str]:
+        values: dict[str, object] = {
+            "output_dir": self.config.output_path,
+            "workers": self.config.workers,
+            "fragments": self.config.fragments,
+            "quality": self.config.quality,
+        }
+        step = 0
+        while step < 4:
+            try:
+                if step == 0:
+                    values["output_dir"] = self._prompt_path("Output folder", values["output_dir"])
+                elif step == 1:
+                    values["workers"] = self._prompt_int("Parallel track downloads", default=int(values["workers"]))
+                elif step == 2:
+                    values["fragments"] = self._prompt_int("Parallel fragments per track", default=int(values["fragments"]))
+                else:
+                    values["quality"] = self._prompt_text("MP3 bitrate", default=str(values["quality"]))
+            except BackRequested:
+                if step == 0:
+                    raise
+                step -= 1
+                continue
+            step += 1
+        return (
+            values["output_dir"],
+            int(values["workers"]),
+            int(values["fragments"]),
+            str(values["quality"]),
+        )
+
     def _prompt_urls(self) -> list[str]:
         urls: list[str] = []
-        console.print("Paste SoundCloud track, playlist, or likes links. Blank line starts.")
+        console.print("Paste SoundCloud track, playlist, or likes links. Blank line starts. Type 'b' to go back.")
         while True:
-            line = Prompt.ask("URL", default="").strip()
+            line = self._prompt_text("URL", default="", allow_back=False).strip()
+            if line.lower() in BACK_VALUES:
+                raise BackRequested
             if not line:
                 return urls
             urls.extend(line.split())
 
     def _prompt_path(self, label: str, default: Path) -> Path:
-        value = Prompt.ask(label, default=str(default.expanduser())).strip()
+        value = self._prompt_text(label, default=str(default.expanduser())).strip()
         return _resolve_download_path(value, default)
+
+    def _prompt_text(
+        self,
+        label: str,
+        *,
+        default: str,
+        choices: list[str] | None = None,
+        allow_back: bool = True,
+    ) -> str:
+        while True:
+            suffix = " (b=back)" if allow_back else ""
+            value = Prompt.ask(f"{label}{suffix}", default=default).strip()
+            if allow_back and value.lower() in BACK_VALUES:
+                raise BackRequested
+            if choices is None or value in choices:
+                return value
+            console.print(f"[red]Choose one of:[/red] {', '.join(choices)}")
+
+    def _prompt_int(self, label: str, *, default: int, allow_back: bool = True) -> int:
+        while True:
+            value = self._prompt_text(label, default=str(default), allow_back=allow_back)
+            try:
+                return int(value)
+            except ValueError:
+                console.print("[red]Enter a number[/red]")
+
+    def _prompt_confirm(self, label: str, *, default: bool, allow_back: bool = True) -> bool:
+        if self._interactive_selector_available():
+            return bool(
+                self._select_option(
+                    label,
+                    [("Yes", True), ("No", False)],
+                    default_index=0 if default else 1,
+                    allow_back=allow_back,
+                )
+            )
+
+        default_text = "y" if default else "n"
+        while True:
+            value = self._prompt_text(label, default=default_text, allow_back=allow_back).strip().lower()
+            if not value:
+                return default
+            if value in {"y", "yes", "true", "1"}:
+                return True
+            if value in {"n", "no", "false", "0"}:
+                return False
+            console.print("[red]Enter y or n[/red]")
+
+    def _select_option(
+        self,
+        title: str,
+        options: list[tuple[str, object]],
+        *,
+        default_index: int = 0,
+        allow_back: bool = True,
+        allow_quit: bool = False,
+        header_title: str | None = None,
+    ) -> object:
+        if not options:
+            raise ValueError("options required")
+        if not self._interactive_selector_available():
+            return self._select_option_fallback(
+                title,
+                options,
+                default_index=default_index,
+                allow_back=allow_back,
+                allow_quit=allow_quit,
+                header_title=header_title,
+            )
+
+        selected = max(0, min(default_index, len(options) - 1))
+        while True:
+            console.clear()
+            if header_title:
+                self._header(header_title)
+            table = Table(title=title, box=box.SIMPLE, show_header=False)
+            table.add_column("", width=2)
+            table.add_column("Option")
+            for index, (label, _value) in enumerate(options):
+                marker = ">" if index == selected else " "
+                style = "reverse cyan" if index == selected else None
+                table.add_row(marker, label, style=style)
+            console.print(table)
+            hints = ["up/down: move", "enter: select"]
+            if allow_back:
+                hints.append("b: back")
+            if allow_quit:
+                hints.append("q: quit")
+            console.print(f"[dim]{' | '.join(hints)}[/dim]")
+
+            key = _read_key()
+            if key == "up":
+                selected = (selected - 1) % len(options)
+            elif key == "down":
+                selected = (selected + 1) % len(options)
+            elif key == "enter":
+                return options[selected][1]
+            elif key == "back" and allow_back:
+                raise BackRequested
+            elif key == "quit" and allow_quit:
+                return "q"
+            elif key.isdigit():
+                index = int(key) - 1
+                if 0 <= index < len(options):
+                    return options[index][1]
+
+    def _select_option_fallback(
+        self,
+        title: str,
+        options: list[tuple[str, object]],
+        *,
+        default_index: int,
+        allow_back: bool,
+        allow_quit: bool,
+        header_title: str | None,
+    ) -> object:
+        if header_title:
+            self._header(header_title)
+        table = Table(title=title, box=box.SIMPLE, show_header=False)
+        table.add_column("Key", style="cyan", width=4)
+        table.add_column("Option")
+        for index, (label, _value) in enumerate(options, start=1):
+            table.add_row(str(index), label)
+        if allow_back:
+            table.add_row("b", "Back")
+        has_quit_option = any(str(value).lower() in {"q", "quit", "exit"} for _label, value in options)
+        if allow_quit and not has_quit_option:
+            table.add_row("q", "Quit")
+        console.print(table)
+
+        default = str(default_index + 1)
+        while True:
+            choice = Prompt.ask(title, default=default).strip().lower()
+            if allow_back and choice in BACK_VALUES:
+                raise BackRequested
+            if allow_quit and choice in {"q", "quit", "exit"}:
+                return "q"
+            if choice.isdigit():
+                index = int(choice) - 1
+                if 0 <= index < len(options):
+                    return options[index][1]
+            console.print("[red]Unknown choice[/red]")
+
+    def _interactive_selector_available(self) -> bool:
+        return bool(sys.stdin.isatty() and console.is_terminal)
+
+    def _wait_for_rekordbox_close(self, *, timeout_sec: float = 60.0) -> bool:
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            if not rekordbox_running():
+                return True
+            time.sleep(1)
+        return not rekordbox_running()
 
     def _header(self, title: str = "SoundCloud DL") -> None:
         console.print(
@@ -626,6 +846,38 @@ def _archive_for_output(output_dir: Path, source_name: str | None = None) -> Pat
 def _safe_slug(value: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip()).strip("-._").lower()
     return slug[:80] or "soundcloud"
+
+
+def _read_key() -> str:
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        char = sys.stdin.read(1)
+        if char == "\x03":
+            raise KeyboardInterrupt
+        if char in {"\r", "\n"}:
+            return "enter"
+        if char in {"b", "B", "\x7f"}:
+            return "back"
+        if char in {"q", "Q"}:
+            return "quit"
+        if char == "\x1b":
+            sequence = ""
+            if select.select([sys.stdin], [], [], 0.05)[0]:
+                sequence += sys.stdin.read(1)
+            if select.select([sys.stdin], [], [], 0.05)[0]:
+                sequence += sys.stdin.read(1)
+            if sequence == "[A":
+                return "up"
+            if sequence == "[B":
+                return "down"
+            if sequence == "[D":
+                return "back"
+            return "escape"
+        return char
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 if __name__ == "__main__":
