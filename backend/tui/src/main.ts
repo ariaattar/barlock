@@ -11,6 +11,7 @@ import {
   type SelectOption,
 } from "@opentui/core"
 import { spawn } from "node:child_process"
+import { cpus } from "node:os"
 import { basename, isAbsolute, join, resolve } from "node:path"
 
 type Config = {
@@ -65,6 +66,19 @@ type SelectItem<T> = {
   label: string
   description?: string
   value: T
+}
+
+type FlowProgress = {
+  name: string
+  step: number
+  total: number
+  label: string
+}
+
+type DownloadSettings = {
+  workers: number
+  fragments: number
+  quality: string
 }
 
 class Back extends Error {}
@@ -281,138 +295,372 @@ class TuiApp {
   }
 
   private async downloadFlow(prefilledUrls?: string[], fallbackName = "SoundCloud Download"): Promise<void> {
-    const urls = prefilledUrls ?? splitUrls(
-      await this.input("SoundCloud URL(s)", "Paste SoundCloud URL(s)", "", {
-        placeholder: "https://soundcloud.com/artist/track",
-      }),
-    )
-    if (!urls.length) {
-      return
+    const stepLabels = prefilledUrls
+      ? ["Review tracks", "Output folder", "Download", "Analyze", "Tags", "Import files", "Rekordbox"]
+      : ["SoundCloud URL", "Review tracks", "Output folder", "Download", "Analyze", "Tags", "Import files", "Rekordbox"]
+    const state: {
+      urls: string[]
+      plan?: DownloadPlan
+      sourceName: string
+      outputDir?: string
+      result?: BridgeEvent
+      paths: string[]
+      entries: DownloadEntry[]
+      features?: Feature[]
+      wroteTags?: boolean
+      wroteImportFiles?: boolean
+    } = {
+      urls: prefilledUrls ? [...prefilledUrls] : [],
+      sourceName: fallbackName,
+      paths: [],
+      entries: [],
     }
-
-    const plan = await this.status("Expanding SoundCloud", ["Reading playlist metadata..."], async (write) => {
-      const plan = (await this.bridge.json("plan", urls)) as unknown as DownloadPlan & { ok: boolean }
-      write(`Found ${plan.count} track(s).`)
-      return plan
+    const settings = optimalDownloadSettings(this.config)
+    let step = 0
+    const flow = () => ({
+      name: "Download & Import",
+      step: step + 1,
+      total: stepLabels.length,
+      label: stepLabels[step],
     })
-    const sourceName = plan.title || fallbackName
-    await this.confirmPlan(plan, sourceName)
-
-    const outputInput = await this.input(
-      "Output Folder",
-      "Folder",
-      suggestedOutputFolder(this.config.output_dir, sourceName),
-      { placeholder: "set-2" },
-    )
-    const outputDir = resolveDownloadPath(outputInput, this.config.output_dir)
-    const workers = await this.numberInput("Parallel Track Downloads", this.config.workers)
-    const fragments = await this.numberInput("Parallel Fragments Per Track", this.config.fragments)
-    const quality = await this.input("MP3 Bitrate", "Bitrate", this.config.quality, { placeholder: "320" })
-
-    const confirmed = await this.confirm(
-      "Download",
-      [`Download ${plan.count} track(s) to`, outputDir],
-      true,
-    )
-    if (!confirmed) {
-      return
+    const resetAfterSource = () => {
+      state.plan = undefined
+      state.outputDir = undefined
+      state.result = undefined
+      state.paths = []
+      state.entries = []
+      state.features = undefined
+      state.wroteTags = undefined
+      state.wroteImportFiles = undefined
+    }
+    const resetAfterOutput = () => {
+      state.result = undefined
+      state.paths = []
+      state.entries = []
+      state.features = undefined
+      state.wroteTags = undefined
+      state.wroteImportFiles = undefined
     }
 
-    const final = await this.status("Downloading", [], async (write) => {
-      return await this.bridge.events(
-        "download",
-        [
-          ...urls,
-          "--output-dir",
-          outputDir,
-          "--workers",
-          String(workers),
-          "--fragments",
-          String(fragments),
-          "--quality",
-          quality,
-        ],
-        undefined,
-        (event) => {
-          if (event.message) {
-            write(String(event.message))
+    while (step < stepLabels.length && this.running) {
+      try {
+        const current = stepLabels[step]
+        if (current === "SoundCloud URL") {
+          const previous = state.urls.join(" ")
+          const value = await this.input("SoundCloud URL(s)", "Paste SoundCloud URL(s)", previous, {
+            placeholder: "https://soundcloud.com/artist/track",
+            flow: flow(),
+          })
+          const urls = splitUrls(value)
+          if (!urls.length) {
+            return
           }
-          if (event.event === "done" && Number(event.failed_count || 0) > 0) {
-            write(`Failed ${event.failed_count} track(s). Report: ${event.failed_report}`)
+          if (urls.join("\n") !== state.urls.join("\n")) {
+            state.urls = urls
+            resetAfterSource()
           }
-        },
-      )
-    })
-
-    const paths = stringArray(final.paths)
-    if (!paths.length) {
-      await this.message("Download Complete", ["No local MP3 paths were found after download."], "Back")
-      return
+          step += 1
+        } else if (current === "Review tracks") {
+          if (!state.plan) {
+            state.plan = await this.status("Expanding SoundCloud", ["Reading playlist metadata..."], async (write) => {
+              const plan = (await this.bridge.json("plan", state.urls)) as unknown as DownloadPlan & { ok: boolean }
+              write(`Found ${plan.count} track(s).`)
+              return plan
+            }, flow())
+            state.sourceName = state.plan.title || fallbackName
+          }
+          await this.confirmPlan(state.plan, state.sourceName, flow())
+          step += 1
+        } else if (current === "Output folder") {
+          const outputInput = await this.input(
+            "Output Folder",
+            "Folder",
+            state.outputDir || suggestedOutputFolder(this.config.output_dir, state.sourceName),
+            { placeholder: "set-2", flow: flow() },
+          )
+          const outputDir = resolveDownloadPath(outputInput, this.config.output_dir)
+          if (outputDir !== state.outputDir) {
+            state.outputDir = outputDir
+            resetAfterOutput()
+          }
+          step += 1
+        } else if (current === "Download") {
+          if (!state.plan || !state.outputDir) {
+            step = Math.max(0, step - 1)
+            continue
+          }
+          if (!state.result) {
+            const confirmed = await this.confirm(
+              "Download",
+              [
+                `Download ${state.plan.count} track(s) to`,
+                state.outputDir,
+                "Download quality and parallelism are optimized automatically.",
+              ],
+              true,
+              flow(),
+            )
+            if (!confirmed) {
+              return
+            }
+            state.result = await this.status("Downloading", [], async (write) => {
+              return await this.bridge.events(
+                "download",
+                [
+                  ...state.urls,
+                  "--output-dir",
+                  state.outputDir || this.config.output_dir,
+                  "--workers",
+                  String(settings.workers),
+                  "--fragments",
+                  String(settings.fragments),
+                  "--quality",
+                  settings.quality,
+                ],
+                undefined,
+                (event) => {
+                  if (event.message) {
+                    write(String(event.message))
+                  }
+                  if (event.event === "done" && Number(event.failed_count || 0) > 0) {
+                    write(`Failed ${event.failed_count} track(s). Report: ${event.failed_report}`)
+                  }
+                },
+              )
+            }, flow())
+            state.paths = stringArray(state.result.paths)
+            state.entries = (state.result.entries || []) as DownloadEntry[]
+          }
+          if (!state.paths.length) {
+            await this.message("Download Complete", ["No local MP3 paths were found after download."], "Back", flow())
+            return
+          }
+          await this.message("Download Complete", [
+            `${state.paths.length} local file(s) ready.`,
+            state.result && Number(state.result.failed_count || 0) > 0
+              ? `Failed tracks report: ${state.result.failed_report}`
+              : "All available tracks are ready for analysis.",
+          ], "Continue", flow())
+          step += 1
+        } else if (current === "Analyze") {
+          if (state.features === undefined) {
+            const shouldAnalyze = await this.confirm(
+              "Analyze",
+              ["Analyze BPM/key/energy and cue hints now?"],
+              this.config.analyze_after_download,
+              flow(),
+            )
+            if (!shouldAnalyze) {
+              return
+            }
+            state.features = await this.analyzePaths(state.paths, state.entries, state.outputDir || this.config.output_dir, flow())
+          } else {
+            await this.analysisSummary(state.features, flow())
+          }
+          if (!state.features.length) {
+            return
+          }
+          step += 1
+        } else if (current === "Tags") {
+          if (!state.features?.length) {
+            return
+          }
+          if (state.wroteTags === undefined) {
+            const shouldWriteTags = await this.confirm(
+              "Tags",
+              ["Write BPM/key/title ID3 tags to MP3 files?"],
+              this.config.write_tags,
+              flow(),
+            )
+            if (shouldWriteTags) {
+              await this.runFeatureCommand("write-tags", "Writing Tags", state.features, {}, flow())
+            }
+            state.wroteTags = shouldWriteTags
+          } else {
+            await this.message("Tags", [state.wroteTags ? "Tags are written." : "Tag writing was skipped."], "Continue", flow())
+          }
+          step += 1
+        } else if (current === "Import files") {
+          if (!state.features?.length) {
+            return
+          }
+          if (state.wroteImportFiles === undefined) {
+            const shouldWriteImport = await this.confirm(
+              "Import Files",
+              ["Generate Rekordbox M3U/XML import files?"],
+              this.config.create_import_files,
+              flow(),
+            )
+            if (shouldWriteImport) {
+              await this.runFeatureCommand(
+                "write-import-files",
+                "Writing Import Files",
+                state.features,
+                { output_dir: state.outputDir, source_name: state.sourceName },
+                flow(),
+              )
+            }
+            state.wroteImportFiles = shouldWriteImport
+          } else {
+            await this.message(
+              "Import Files",
+              [state.wroteImportFiles ? "Import files are written." : "Import file generation was skipped."],
+              "Continue",
+              flow(),
+            )
+          }
+          step += 1
+        } else if (current === "Rekordbox") {
+          if (!state.features?.length) {
+            return
+          }
+          if (await this.confirm("Rekordbox", ["Push directly to a Rekordbox playlist?"], this.config.direct_rekordbox_push, flow())) {
+            await this.pushFeatures(state.features, state.sourceName, state.outputDir || this.config.output_dir)
+          }
+          return
+        }
+      } catch (error) {
+        if (error instanceof Back) {
+          if (step === 0) {
+            return
+          }
+          step -= 1
+          continue
+        }
+        throw error
+      }
     }
-
-    const features = await this.afterDownloadPrompts(paths, final.entries as DownloadEntry[], outputDir, sourceName)
-    if (features.length && await this.confirm("Rekordbox", ["Push directly to a Rekordbox playlist?"], this.config.direct_rekordbox_push)) {
-      await this.pushFeatures(features, sourceName, outputDir)
-    }
-  }
-
-  private async afterDownloadPrompts(
-    paths: string[],
-    entries: DownloadEntry[],
-    outputDir: string,
-    sourceName: string,
-  ): Promise<Feature[]> {
-    let features: Feature[] = []
-    if (await this.confirm("Analyze", ["Analyze BPM/key/energy and cue hints now?"], this.config.analyze_after_download)) {
-      features = await this.analyzePaths(paths, entries, outputDir)
-    }
-    if (!features.length) {
-      return []
-    }
-    if (await this.confirm("Tags", ["Write BPM/key/title ID3 tags to MP3 files?"], this.config.write_tags)) {
-      await this.runFeatureCommand("write-tags", "Writing Tags", features)
-    }
-    if (await this.confirm("Import Files", ["Generate Rekordbox M3U/XML import files?"], this.config.create_import_files)) {
-      await this.runFeatureCommand("write-import-files", "Writing Import Files", features, { output_dir: outputDir, source_name: sourceName })
-    }
-    return features
   }
 
   private async analyzeFolderFlow(pushAfter: boolean): Promise<void> {
-    const folderInput = await this.input("Analyze Folder", "Folder", this.config.output_dir, { placeholder: "set-2" })
-    const folder = resolveDownloadPath(folderInput, this.config.output_dir)
-    const features = await this.analyzeFolder(folder)
-    if (!features.length) {
-      return
-    }
-    if (!pushAfter && await this.confirm("Tags", ["Write BPM/key/title ID3 tags to MP3 files?"], this.config.write_tags)) {
-      await this.runFeatureCommand("write-tags", "Writing Tags", features)
-    }
-    if (!pushAfter && await this.confirm("Import Files", ["Generate Rekordbox M3U/XML import files?"], this.config.create_import_files)) {
-      await this.runFeatureCommand("write-import-files", "Writing Import Files", features, {
-        output_dir: folder,
-        source_name: basename(folder),
-      })
-    }
-    if (pushAfter || await this.confirm("Rekordbox", ["Push these tracks to a Rekordbox playlist?"], false)) {
-      await this.pushFeatures(features, basename(folder), folder)
+    const stepLabels = pushAfter
+      ? ["Folder", "Analyze", "Rekordbox"]
+      : ["Folder", "Analyze", "Tags", "Import files", "Rekordbox"]
+    let step = 0
+    let folder = ""
+    let features: Feature[] | undefined
+    let wroteTags: boolean | undefined
+    let wroteImportFiles: boolean | undefined
+    const flow = () => ({
+      name: pushAfter ? "Folder Push" : "Folder Prep",
+      step: step + 1,
+      total: stepLabels.length,
+      label: stepLabels[step],
+    })
+
+    while (step < stepLabels.length && this.running) {
+      try {
+        const current = stepLabels[step]
+        if (current === "Folder") {
+          const folderInput = await this.input("Analyze Folder", "Folder", folder || this.config.output_dir, {
+            placeholder: "set-2",
+            flow: flow(),
+          })
+          const nextFolder = resolveDownloadPath(folderInput, this.config.output_dir)
+          if (nextFolder !== folder) {
+            folder = nextFolder
+            features = undefined
+            wroteTags = undefined
+            wroteImportFiles = undefined
+          }
+          step += 1
+        } else if (current === "Analyze") {
+          if (!features) {
+            features = await this.analyzeFolder(folder, flow())
+          } else {
+            await this.analysisSummary(features, flow())
+          }
+          if (!features.length) {
+            return
+          }
+          step += 1
+        } else if (current === "Tags") {
+          if (!features?.length) {
+            return
+          }
+          if (wroteTags === undefined) {
+            const shouldWriteTags = await this.confirm(
+              "Tags",
+              ["Write BPM/key/title ID3 tags to MP3 files?"],
+              this.config.write_tags,
+              flow(),
+            )
+            if (shouldWriteTags) {
+              await this.runFeatureCommand("write-tags", "Writing Tags", features, {}, flow())
+            }
+            wroteTags = shouldWriteTags
+          } else {
+            await this.message("Tags", [wroteTags ? "Tags are written." : "Tag writing was skipped."], "Continue", flow())
+          }
+          step += 1
+        } else if (current === "Import files") {
+          if (!features?.length) {
+            return
+          }
+          if (wroteImportFiles === undefined) {
+            const shouldWriteImport = await this.confirm(
+              "Import Files",
+              ["Generate Rekordbox M3U/XML import files?"],
+              this.config.create_import_files,
+              flow(),
+            )
+            if (shouldWriteImport) {
+              await this.runFeatureCommand("write-import-files", "Writing Import Files", features, {
+                output_dir: folder,
+                source_name: basename(folder),
+              }, flow())
+            }
+            wroteImportFiles = shouldWriteImport
+          } else {
+            await this.message(
+              "Import Files",
+              [wroteImportFiles ? "Import files are written." : "Import file generation was skipped."],
+              "Continue",
+              flow(),
+            )
+          }
+          step += 1
+        } else if (current === "Rekordbox") {
+          if (!features?.length) {
+            return
+          }
+          if (pushAfter || await this.confirm("Rekordbox", ["Push these tracks to a Rekordbox playlist?"], false, flow())) {
+            await this.pushFeatures(features, basename(folder), folder)
+          }
+          return
+        }
+      } catch (error) {
+        if (error instanceof Back) {
+          if (step === 0) {
+            return
+          }
+          step -= 1
+          continue
+        }
+        throw error
+      }
     }
   }
 
-  private async analyzeFolder(folder: string): Promise<Feature[]> {
+  private async analyzeFolder(folder: string, flow?: FlowProgress): Promise<Feature[]> {
     const final = await this.status("Analyzing", [], async (write) => {
       return await this.bridge.events("analyze", ["--folder", folder, "--output-dir", folder], undefined, (event) => {
         if (event.message) {
           write(String(event.message))
         }
       })
-    })
+    }, flow)
     const features = (final.features || []) as Feature[]
-    await this.analysisSummary(features)
+    await this.analysisSummary(features, flow)
     return features
   }
 
-  private async analyzePaths(paths: string[], entries: DownloadEntry[], outputDir: string): Promise<Feature[]> {
+  private async analyzePaths(
+    paths: string[],
+    entries: DownloadEntry[],
+    outputDir: string,
+    flow?: FlowProgress,
+  ): Promise<Feature[]> {
     const final = await this.status("Analyzing", [], async (write) => {
       return await this.bridge.events(
         "analyze",
@@ -424,9 +672,9 @@ class TuiApp {
           }
         },
       )
-    })
+    }, flow)
     const features = (final.features || []) as Feature[]
-    await this.analysisSummary(features)
+    await this.analysisSummary(features, flow)
     return features
   }
 
@@ -435,6 +683,7 @@ class TuiApp {
     title: string,
     features: Feature[],
     extra: Record<string, unknown> = {},
+    flow?: FlowProgress,
   ): Promise<void> {
     const final = await this.status(title, [], async (write) => {
       return await this.bridge.events(command, [], { features, ...extra }, (event) => {
@@ -442,97 +691,137 @@ class TuiApp {
           write(String(event.message))
         }
       })
-    })
+    }, flow)
     const lines = command === "write-import-files"
       ? [`M3U: ${final.m3u}`, `XML: ${final.xml}`]
       : [`Updated ${final.count} track(s).`]
-    await this.message(title, lines, "Back")
+    await this.message(title, lines, "Continue", flow)
   }
 
   private async pushFeatures(features: Feature[], defaultPlaylistName: string, outputDir: string): Promise<void> {
-    const running = await this.bridge.json("rekordbox-running")
-    if (running.running) {
-      const action = await this.select("Rekordbox Is Open", [
-        { label: "Close Rekordbox and continue", description: "Recommended for direct database writes", value: "close" },
-        { label: "I closed it, check again", value: "check" },
-        { label: "Generate import files instead", value: "files" },
-        { label: "Back", value: "back" },
-      ])
-      if (action === "back") {
-        return
-      }
-      if (action === "files") {
-        await this.runFeatureCommand("write-import-files", "Writing Import Files", features, {
-          output_dir: outputDir,
-          source_name: defaultPlaylistName,
-        })
-        return
-      }
-      if (action === "close") {
-        await this.status("Closing Rekordbox", ["Asking Rekordbox to quit..."], async () => {
-          return await this.bridge.json("close-rekordbox")
-        })
-      }
-      const after = await this.bridge.json("rekordbox-running")
-      if (after.running) {
-        await this.message("Rekordbox Still Open", ["Close Rekordbox, then try the push again."], "Back")
-        return
-      }
-    }
-
-    const destination = await this.select("Rekordbox Playlist", [
-      { label: "Use existing playlist", value: "existing" },
-      { label: "Create new playlist", value: "create" },
-      { label: "Back", value: "back" },
-    ])
-    if (destination === "back") {
-      return
-    }
-
+    const stepLabels = ["Rekordbox state", "Destination", "Playlist", "Confirm push", "Write database"]
+    let step = 0
+    let destination: "existing" | "create" | undefined
     let playlistName = defaultPlaylistName || this.config.rekordbox_playlist
     let playlistId = ""
-    let createPlaylist = destination === "create"
-
-    if (destination === "existing") {
-      const playlist = await this.pickPlaylist(playlistName)
-      playlistName = playlist.name
-      playlistId = playlist.id
-      createPlaylist = false
-    } else {
-      playlistName = await this.input("New Rekordbox Playlist", "Name", playlistName || this.config.rekordbox_playlist)
-    }
-
-    if (!await this.confirm("Push To Rekordbox", [`Push ${features.length} track(s) to`, playlistName], true)) {
-      return
-    }
-
-    const final = await this.status("Pushing To Rekordbox", [], async (write) => {
-      write("Writing collection, playlist rows, metadata, cues, and loops...")
-      return await this.bridge.events(
-        "push",
-        [],
-        { features, playlist_name: playlistName, playlist_id: playlistId, create_playlist: createPlaylist },
-        (event) => {
-          if (event.message) {
-            write(String(event.message))
-          }
-        },
-      )
+    let createPlaylist = false
+    let rekordboxReady = false
+    const flow = () => ({
+      name: "Rekordbox Push",
+      step: step + 1,
+      total: stepLabels.length,
+      label: stepLabels[step],
     })
-    await this.message("Rekordbox Push Complete", [
-      `Playlist: ${final.playlist_name}`,
-      `Added to playlist: ${final.added_to_playlist}`,
-      `Already in playlist: ${final.already_in_playlist}`,
-      `Cues added: ${final.added_cues}`,
-      `Loops added: ${final.added_loops}`,
-      `Backup: ${final.backup_dir}`,
-    ], "Back")
+
+    while (step < stepLabels.length && this.running) {
+      try {
+        const current = stepLabels[step]
+        if (current === "Rekordbox state") {
+          const running = await this.bridge.json("rekordbox-running")
+          if (running.running) {
+            const action = await this.select("Rekordbox Is Open", [
+              { label: "Close Rekordbox and continue", description: "Recommended for direct database writes", value: "close" },
+              { label: "I closed it, check again", value: "check" },
+              { label: "Generate import files instead", value: "files" },
+            ], { flow: flow() })
+            if (action === "files") {
+              await this.runFeatureCommand("write-import-files", "Writing Import Files", features, {
+                output_dir: outputDir,
+                source_name: defaultPlaylistName,
+              }, flow())
+              return
+            }
+            if (action === "close") {
+              await this.status("Closing Rekordbox", ["Asking Rekordbox to quit..."], async () => {
+                return await this.bridge.json("close-rekordbox")
+              }, flow())
+            }
+            const after = await this.bridge.json("rekordbox-running")
+            if (after.running) {
+              await this.message("Rekordbox Still Open", ["Close Rekordbox, then try the push again."], "Back", flow())
+              return
+            }
+          }
+          rekordboxReady = true
+          step += 1
+        } else if (current === "Destination") {
+          if (!rekordboxReady) {
+            step = 0
+            continue
+          }
+          destination = await this.select("Rekordbox Playlist", [
+            { label: "Use existing playlist", value: "existing" },
+            { label: "Create new playlist", value: "create" },
+          ], { flow: flow() })
+          createPlaylist = destination === "create"
+          playlistId = ""
+          step += 1
+        } else if (current === "Playlist") {
+          if (destination === "existing") {
+            const playlist = await this.pickPlaylist(playlistName, flow())
+            playlistName = playlist.name
+            playlistId = playlist.id
+            createPlaylist = false
+          } else {
+            playlistName = await this.input("New Rekordbox Playlist", "Name", playlistName || this.config.rekordbox_playlist, {
+              flow: flow(),
+            })
+            createPlaylist = true
+            playlistId = ""
+          }
+          step += 1
+        } else if (current === "Confirm push") {
+          const confirmed = await this.confirm(
+            "Push To Rekordbox",
+            [`Push ${features.length} track(s) to`, playlistName],
+            true,
+            flow(),
+          )
+          if (!confirmed) {
+            return
+          }
+          step += 1
+        } else if (current === "Write database") {
+          const final = await this.status("Pushing To Rekordbox", [], async (write) => {
+            write("Writing collection, playlist rows, metadata, cues, and loops...")
+            return await this.bridge.events(
+              "push",
+              [],
+              { features, playlist_name: playlistName, playlist_id: playlistId, create_playlist: createPlaylist },
+              (event) => {
+                if (event.message) {
+                  write(String(event.message))
+                }
+              },
+            )
+          }, flow())
+          await this.message("Rekordbox Push Complete", [
+            `Playlist: ${final.playlist_name}`,
+            `Added to playlist: ${final.added_to_playlist}`,
+            `Already in playlist: ${final.already_in_playlist}`,
+            `Cues added: ${final.added_cues}`,
+            `Loops added: ${final.added_loops}`,
+            `Backup: ${final.backup_dir}`,
+          ], "Done", flow(), false)
+          return
+        }
+      } catch (error) {
+        if (error instanceof Back) {
+          if (step === 0) {
+            throw error
+          }
+          step -= 1
+          continue
+        }
+        throw error
+      }
+    }
   }
 
-  private async pickPlaylist(defaultName: string): Promise<Playlist> {
+  private async pickPlaylist(defaultName: string, flow?: FlowProgress): Promise<Playlist> {
     const raw = await this.bridge.json("list-playlists")
     const playlists = ((raw.playlists || []) as Playlist[]).filter((playlist) => !playlist.is_folder)
-    const search = (await this.input("Search Playlists", "Search", defaultName)).trim().toLowerCase()
+    const search = (await this.input("Search Playlists", "Search", defaultName, { flow })).trim().toLowerCase()
     const matches = (search ? playlists.filter((playlist) => playlist.path.toLowerCase().includes(search)) : playlists).slice(0, 40)
     if (!matches.length) {
       throw new Error("No matching Rekordbox playlists found.")
@@ -541,7 +830,7 @@ class TuiApp {
       label: playlist.path,
       description: `${playlist.song_count} track(s)`,
       value: playlist,
-    })))
+    })), { flow })
   }
 
   private async doctorFlow(): Promise<void> {
@@ -559,9 +848,6 @@ class TuiApp {
   private async settingsFlow(): Promise<void> {
     const soundcloudUsername = await this.input("Settings", "SoundCloud username", this.config.soundcloud_username)
     const outputDir = resolveDownloadPath(await this.input("Settings", "Default output folder", this.config.output_dir), this.config.output_dir)
-    const workers = await this.numberInput("Parallel Track Downloads", this.config.workers)
-    const fragments = await this.numberInput("Parallel Fragments Per Track", this.config.fragments)
-    const quality = await this.input("Settings", "MP3 bitrate", this.config.quality)
     const rekordboxPlaylist = await this.input("Settings", "Default Rekordbox playlist", this.config.rekordbox_playlist)
     const analyzeAfterDownload = await this.confirm("Settings", ["Analyze after download by default?"], this.config.analyze_after_download)
     const writeTags = await this.confirm("Settings", ["Write tags by default?"], this.config.write_tags)
@@ -571,9 +857,6 @@ class TuiApp {
     const raw = await this.bridge.json("save-config", [], {
       soundcloud_username: soundcloudUsername.trim() || this.config.soundcloud_username,
       output_dir: outputDir,
-      workers,
-      fragments,
-      quality,
       rekordbox_playlist: rekordboxPlaylist.trim() || this.config.rekordbox_playlist,
       analyze_after_download: analyzeAfterDownload,
       write_tags: writeTags,
@@ -584,15 +867,15 @@ class TuiApp {
     await this.message("Settings Saved", [this.config.config_path], "Back")
   }
 
-  private async confirmPlan(plan: DownloadPlan, sourceName: string): Promise<void> {
+  private async confirmPlan(plan: DownloadPlan, sourceName: string, flow?: FlowProgress): Promise<void> {
     const preview = plan.entries.slice(0, 8).map((entry, index) => `${index + 1}. ${entry.label}`)
     if (plan.entries.length > preview.length) {
       preview.push(`... ${plan.entries.length - preview.length} more`)
     }
-    await this.message(`Found ${plan.count} Track(s)`, [`Source: ${sourceName}`, ...preview], "Continue")
+    await this.message(`Found ${plan.count} Track(s)`, [`Source: ${sourceName}`, ...preview], "Continue", flow)
   }
 
-  private async analysisSummary(features: Feature[]): Promise<void> {
+  private async analysisSummary(features: Feature[], flow?: FlowProgress): Promise<void> {
     const preview = features.slice(0, 8).map((item) => {
       const artist = item.artist ? `${item.artist} - ` : ""
       const key = item.camelot_key || item.musical_key || "key?"
@@ -601,36 +884,37 @@ class TuiApp {
     if (features.length > preview.length) {
       preview.push(`... ${features.length - preview.length} more`)
     }
-    await this.message("Analysis Complete", preview.length ? preview : ["No tracks analyzed."], "Continue")
+    await this.message("Analysis Complete", preview.length ? preview : ["No tracks analyzed."], "Continue", flow)
   }
 
-  private async numberInput(title: string, defaultValue: number): Promise<number> {
-    while (true) {
-      const value = await this.input(title, "Value", String(defaultValue))
-      const parsed = Number.parseInt(value, 10)
-      if (Number.isFinite(parsed) && parsed > 0) {
-        return parsed
-      }
-      await this.message(title, ["Enter a positive number."], "Back")
-    }
-  }
-
-  private async confirm(title: string, lines: string[], defaultValue: boolean): Promise<boolean> {
+  private async confirm(title: string, lines: string[], defaultValue: boolean, flow?: FlowProgress): Promise<boolean> {
     const prefix = lines.length ? lines.join("\n") + "\n\n" : ""
     return await this.select(title, [
       { label: "Yes", description: defaultValue ? "Default" : "", value: true },
       { label: "No", description: !defaultValue ? "Default" : "", value: false },
-    ], { intro: prefix, defaultIndex: defaultValue ? 0 : 1 })
+    ], { intro: prefix, defaultIndex: defaultValue ? 0 : 1, flow })
   }
 
-  private async message(title: string, lines: string[], actionLabel: string): Promise<void> {
+  private async message(
+    title: string,
+    lines: string[],
+    actionLabel: string,
+    flow?: FlowProgress,
+    allowBack = true,
+  ): Promise<void> {
     await this.select(title, [{ label: actionLabel, value: "ok" }], {
       intro: lines.join("\n"),
-      allowBack: true,
+      allowBack,
+      flow,
     })
   }
 
-  private async status<T>(title: string, initial: string[], run: (write: (line: string) => void) => Promise<T>): Promise<T> {
+  private async status<T>(
+    title: string,
+    initial: string[],
+    run: (write: (line: string) => void) => Promise<T>,
+    flow?: FlowProgress,
+  ): Promise<T> {
     const lines = [...initial]
     let text: TextRenderable | null = null
     const render = () => {
@@ -647,7 +931,7 @@ class TuiApp {
         height: "auto",
       })
       panel.add(text)
-    }, "Working...")
+    }, "Working...", flow)
     const write = (line: string) => {
       lines.push(line)
       render()
@@ -670,7 +954,7 @@ class TuiApp {
     title: string,
     label: string,
     defaultValue: string,
-    opts: { placeholder?: string } = {},
+    opts: { placeholder?: string; flow?: FlowProgress } = {},
   ): Promise<string> {
     return new Promise((resolveInput, reject) => {
       let input!: InputRenderable
@@ -706,7 +990,7 @@ class TuiApp {
           }
         })
         panel.add(input)
-      }, "Enter to continue | Esc/Left to go back")
+      }, "Enter to continue | Esc/Left to go back", opts.flow)
       input.focus()
     })
   }
@@ -714,7 +998,13 @@ class TuiApp {
   private select<T>(
     title: string,
     items: SelectItem<T>[],
-    opts: { intro?: string; allowBack?: boolean; allowQuit?: boolean; defaultIndex?: number } = {},
+    opts: {
+      intro?: string
+      allowBack?: boolean
+      allowQuit?: boolean
+      defaultIndex?: number
+      flow?: FlowProgress
+    } = {},
   ): Promise<T> {
     return new Promise((resolveSelect, reject) => {
       let menu!: SelectRenderable
@@ -768,12 +1058,17 @@ class TuiApp {
           resolveSelect(option.value as T)
         })
         panel.add(menu)
-      }, "Up/Down select | Enter choose | Esc/B/Left back | q quit")
+      }, "Up/Down select | Enter choose | Esc/B/Left back | q quit", opts.flow)
       menu.focus()
     })
   }
 
-  private renderShell(title: string, build: (panel: BoxRenderable) => void, footer: string): void {
+  private renderShell(
+    title: string,
+    build: (panel: BoxRenderable) => void,
+    footer: string,
+    flow?: FlowProgress,
+  ): void {
     this.clear()
     const root = new BoxRenderable(this.renderer, {
       id: "screen",
@@ -786,7 +1081,7 @@ class TuiApp {
     })
     const header = new BoxRenderable(this.renderer, {
       width: "100%",
-      height: 5,
+      height: flow ? 6 : 5,
       border: true,
       borderStyle: "rounded",
       borderColor: theme.border,
@@ -807,6 +1102,14 @@ class TuiApp {
       width: "100%",
       height: 1,
     }))
+    if (flow) {
+      header.add(new TextRenderable(this.renderer, {
+        content: formatProgress(flow),
+        fg: theme.accent,
+        width: "100%",
+        height: 1,
+      }))
+    }
     root.add(header)
 
     const panel = new BoxRenderable(this.renderer, {
@@ -889,6 +1192,33 @@ function tail<T>(values: T[], count: number): T[] {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms))
+}
+
+function optimalDownloadSettings(config: Config): DownloadSettings {
+  const cpuCount = Math.max(2, cpus().length || 8)
+  const defaultWorkers = Math.min(8, Math.max(4, Math.floor(cpuCount / 2)))
+  return {
+    workers: clampInt(config.workers, defaultWorkers, 2, 12),
+    fragments: clampInt(config.fragments, 8, 4, 12),
+    quality: /^\d+$/.test(String(config.quality || "")) ? String(config.quality) : "320",
+  }
+}
+
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number.parseInt(String(value ?? ""), 10)
+  if (!Number.isFinite(parsed)) {
+    return fallback
+  }
+  return Math.max(min, Math.min(max, parsed))
+}
+
+function formatProgress(flow: FlowProgress): string {
+  const total = Math.max(1, flow.total)
+  const step = Math.max(1, Math.min(flow.step, total))
+  const width = 18
+  const filled = Math.max(1, Math.round((step / total) * width))
+  const bar = "#".repeat(filled) + "-".repeat(Math.max(0, width - filled))
+  return `${flow.name}  [${bar}]  Step ${step}/${total}: ${flow.label}`
 }
 
 function isBackValue(value: string): boolean {

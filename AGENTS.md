@@ -42,6 +42,7 @@ ln -sfn /Users/ariaattar/Documents/Documents/Code/mixer/backend/bin/soundcloud-d
 - Preserve user/manual Rekordbox cues. Only generated SoundCloud DL cues should be overwritten automatically.
 - Keep the normal user workflow interactive through `soundcloud-dl`.
 - Prefer improving the OpenTUI flow over adding extra required commands.
+- Workflow Back behavior should stay local to the current wizard step. Do not let nested prompts bubble directly back to the home menu unless the user backs out from the first step.
 
 ## Analysis And Cue Behavior
 

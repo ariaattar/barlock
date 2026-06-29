@@ -73,12 +73,14 @@ soundcloud-dl
 
 Interactive menus support Up/Down, Enter to select, Escape/Left/`b` to go back, and `q` to quit from menus. Text fields use Escape/Left for back so normal folder names and URLs can include any letters.
 
+Download and import workflows show a `Step X/Y` progress indicator in the header. Back navigation is local to the current workflow, so pressing Left halfway through prep returns to the previous step instead of dumping you at the home menu.
+
 Typical flow:
 
 1. Choose `Download SoundCloud URL or playlist`.
 2. Paste a SoundCloud track, playlist, or likes URL.
 3. Enter an output folder. `set-2` means `~/Downloads/set-2`.
-4. Let it download and analyze.
+4. Let it download and analyze. Download quality and parallelism are chosen automatically.
 5. Write tags and generate Rekordbox import files when prompted.
 6. Push directly to Rekordbox if Rekordbox is closed.
 
@@ -136,11 +138,10 @@ The interactive `Settings` menu controls:
 
 - SoundCloud username for likes
 - Default output folder
-- Download worker count
-- Fragment concurrency
-- MP3 bitrate
 - Default Rekordbox playlist
 - Analyze/tag/import defaults
+
+The interactive flow hides expert download tuning. It automatically uses 320 kbps MP3 output, bounded parallel track downloads, and bounded fragment concurrency based on the saved config and local CPU capacity.
 
 ## Development
 
