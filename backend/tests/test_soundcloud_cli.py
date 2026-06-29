@@ -102,10 +102,12 @@ def test_bridge_push_uses_payload_features(monkeypatch, tmp_path):
         pushed["playlist_id"] = playlist_id
         return SimpleNamespace(
             playlist_name=playlist_name,
+            playlist_id="pl-1",
             added_to_collection=1,
             already_in_collection=0,
             added_to_playlist=1,
             already_in_playlist=0,
+            removed_from_playlist=0,
             added_cues=0,
             skipped_cues=0,
             added_loops=0,
@@ -134,6 +136,91 @@ def test_bridge_push_uses_payload_features(monkeypatch, tmp_path):
         "playlist_id": None,
     }
     assert emitted[-1][0] == "done"
+
+
+def test_parallel_analyze_preserves_order_and_uses_pool(monkeypatch, tmp_path):
+    """With >= 3 paths, the helper dispatches through ProcessPoolExecutor and
+    returns results in the original input order."""
+    from app import soundcloud_bridge
+
+    paths = [tmp_path / f"{i}.mp3" for i in range(5)]
+    for p in paths:
+        p.write_bytes(b"")
+
+    received_workers: dict[str, int] = {}
+
+    class FakeFuture:
+        def __init__(self, result):
+            self._result = result
+        def result(self):
+            return self._result
+
+    class FakeExecutor:
+        def __init__(self, max_workers):
+            received_workers["max_workers"] = max_workers
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def submit(self, fn, item):
+            # Return a feature whose source_id encodes the input order so we can
+            # assert reordering happens correctly when futures arrive out-of-order.
+            path = Path(item[0])
+            return FakeFuture(_features(path))
+
+    def fake_as_completed(futures):
+        # Yield in reverse to prove ordering is restored.
+        return reversed(list(futures))
+
+    monkeypatch.setattr(soundcloud_bridge, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(soundcloud_bridge, "as_completed", fake_as_completed)
+    monkeypatch.setattr(soundcloud_bridge, "_emit", lambda *a, **k: None)
+
+    result = soundcloud_bridge._analyze_paths_parallel(
+        paths,
+        output_dir=tmp_path,
+        extract_vocal_stems=False,
+        workers=3,
+    )
+
+    assert [Path(f.path).name for f in result] == [p.name for p in paths]
+    assert received_workers["max_workers"] == 3
+
+
+def test_parallel_analyze_falls_back_to_serial_for_small_batches(monkeypatch, tmp_path):
+    """A 2-track batch should never spawn a pool — overhead exceeds savings."""
+    from app import soundcloud_bridge
+
+    paths = [tmp_path / "a.mp3", tmp_path / "b.mp3"]
+    for p in paths:
+        p.write_bytes(b"")
+
+    called: dict[str, bool] = {"pool": False}
+
+    class ShouldNotRun:
+        def __init__(self, *args, **kwargs):
+            called["pool"] = True
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def submit(self, fn, item): raise AssertionError("should not submit")
+
+    monkeypatch.setattr(soundcloud_bridge, "ProcessPoolExecutor", ShouldNotRun)
+    monkeypatch.setattr(soundcloud_bridge, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(
+        soundcloud_bridge,
+        "analyze_file",
+        lambda path, **kwargs: _features(path),
+    )
+
+    result = soundcloud_bridge._analyze_paths_parallel(
+        paths,
+        output_dir=tmp_path,
+        extract_vocal_stems=False,
+        workers=4,
+    )
+
+    assert called["pool"] is False
+    assert [Path(f.path).name for f in result] == [p.name for p in paths]
 
 
 def _features(path: Path) -> TrackFeatures:

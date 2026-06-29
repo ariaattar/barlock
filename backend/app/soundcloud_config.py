@@ -23,6 +23,7 @@ class AppConfig:
     write_tags: bool = True
     create_import_files: bool = True
     direct_rekordbox_push: bool = True
+    extract_vocal_stems: bool = False
     last_urls: list[str] = field(default_factory=list)
 
     @property
