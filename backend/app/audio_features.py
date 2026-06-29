@@ -11,7 +11,7 @@ import numpy as np
 import soundfile as sf
 
 AUDIO_EXTS = {".mp3", ".wav", ".aiff", ".aif", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
-ANALYSIS_VERSION = 7
+ANALYSIS_VERSION = 8
 
 NOTE_NAMES = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 MAJOR_PROFILE = np.asarray([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
@@ -527,12 +527,12 @@ def _search_loop_candidates(
         return []
 
     candidates: list[tuple[float, float, int, float]] = []
-    search_start = _snap_up_to_bar(earliest, first_downbeat, bar)
-    search_end = _snap_down_to_bar(latest_end, first_downbeat, bar)
+    beat = bar / 4.0
+    search_start = _snap_up_to_beat(earliest, first_downbeat, beat)
+    search_end = _snap_down_to_beat(latest_end, first_downbeat, beat)
     if search_end <= search_start:
         return []
 
-    beat = bar / 4.0
     for beats in candidate_beats:
         loop_len = beats * beat
         start = search_start
@@ -548,7 +548,7 @@ def _search_loop_candidates(
             )
             if score is not None and score >= _loop_acceptance_threshold(beats):
                 candidates.append((start, end, beats, score))
-            start += bar
+            start += beat
     return candidates
 
 
@@ -683,6 +683,7 @@ def _loop_candidate_score(
     beat = bar / 4.0
     length_beats = int(round(max(1.0, (end - start) / max(beat, 1e-6))))
     length_bias = {4: 1.0, 8: 0.985}.get(length_beats, 0.96)
+    entry_penalty = _exit_entry_transient_penalty(profile, start=start, beat=beat) if role == "exit" else 0.0
 
     score = (
         0.25 * groove_score
@@ -694,6 +695,7 @@ def _loop_candidate_score(
         + 0.07 * timbre_score
     )
     score = min(score * length_bias + 0.03 * energy_score + 0.02 * onset_score, 1.0)
+    score -= 0.09 * entry_penalty
     return max(0.0, min(score, 1.0))
 
 
@@ -793,6 +795,21 @@ def _transition_penalty(profile: LoopProfile, *, start: float, end: float, bar: 
             onset_jump = max(0.0, min((last_ref / body_ref - 1.0) / 2.25, 1.0))
 
     return max(0.0, min(0.45 * rms_jump + 0.35 * onset_jump + 0.20 * last_range, 1.0))
+
+
+def _exit_entry_transient_penalty(profile: LoopProfile, *, start: float, beat: float) -> float:
+    if beat <= 0 or profile.feature_times is None or profile.onset is None or profile.onset.size == 0:
+        return 0.0
+
+    first = _values_between(profile.feature_times, profile.onset, start, start + beat)
+    following = _values_between(profile.feature_times, profile.onset, start + beat, start + 2 * beat)
+    if first.size == 0 or following.size == 0:
+        return 0.0
+
+    first_peak = max(float(np.percentile(first, 90)), 1e-6)
+    following_peak = max(float(np.percentile(following, 90)), 1e-6)
+    surge = (first_peak - following_peak) / max(first_peak, following_peak, 1e-6)
+    return max(0.0, min((surge - 0.08) / 0.25, 1.0))
 
 
 def _onset_presence_score(profile: LoopProfile, *, start: float, end: float) -> float:
