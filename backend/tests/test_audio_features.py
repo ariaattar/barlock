@@ -67,10 +67,14 @@ def test_auto_cue_hints_write_scored_intro_and_exit_loops():
     assert intro_loop.hotcue_slot == 3
     assert intro_loop.seconds >= 16.0
     assert intro_loop.end_seconds > intro_loop.seconds
-    assert intro_loop.loop_bars in {4, 8}
+    assert intro_loop.loop_beats in {4, 8}
+    assert _is_beat_grid_line(intro_loop.seconds, first_downbeat=0.5, beat=0.5)
+    assert _is_beat_grid_line(intro_loop.end_seconds, first_downbeat=0.5, beat=0.5)
     assert exit_loop.hotcue_slot == 4
     assert exit_loop.end_seconds <= 214.5
-    assert exit_loop.loop_bars in {4, 8}
+    assert exit_loop.loop_beats in {4, 8}
+    assert _is_beat_grid_line(exit_loop.seconds, first_downbeat=0.5, beat=0.5)
+    assert _is_beat_grid_line(exit_loop.end_seconds, first_downbeat=0.5, beat=0.5)
 
 
 def test_exit_loop_candidate_avoids_tail_fade_and_uses_stable_audio():
@@ -87,7 +91,7 @@ def test_exit_loop_candidate_avoids_tail_fade_and_uses_stable_audio():
         duration=duration,
         bar=2.0,
         first_downbeat=0.5,
-        preferred_loop_bars=16,
+        preferred_loop_beats=8,
         loop_profile=profile,
     )
 
@@ -96,6 +100,8 @@ def test_exit_loop_candidate_avoids_tail_fade_and_uses_stable_audio():
     assert 144.0 <= start
     assert end <= 214.5
     assert bars in {4, 8}
+    assert _is_beat_grid_line(start, first_downbeat=0.5, beat=0.5)
+    assert _is_beat_grid_line(end, first_downbeat=0.5, beat=0.5)
 
 
 def test_intro_loop_candidate_skips_silent_opening():
@@ -117,6 +123,8 @@ def test_intro_loop_candidate_skips_silent_opening():
     assert start >= 24.0
     assert end > start
     assert bars in {4, 8}
+    assert _is_beat_grid_line(start, first_downbeat=0.5, beat=0.5)
+    assert _is_beat_grid_line(end, first_downbeat=0.5, beat=0.5)
 
 
 def test_loop_candidate_rejects_final_bar_fill():
@@ -128,7 +136,7 @@ def test_loop_candidate_rejects_final_bar_fill():
 
     score = _loop_candidate_score(
         profile,
-        start=16.0,
+        start=28.0,
         end=32.0,
         bar=2.0,
         duration=duration,
@@ -203,3 +211,7 @@ def _profile_from_rms(duration: float, times: np.ndarray, rms: np.ndarray) -> Lo
         rms_times=times,
         rms=rms,
     )
+
+
+def _is_beat_grid_line(value: float, *, first_downbeat: float, beat: float) -> bool:
+    return abs(round((value - first_downbeat) / beat) - ((value - first_downbeat) / beat)) < 0.002

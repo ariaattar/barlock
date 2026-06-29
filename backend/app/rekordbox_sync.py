@@ -382,9 +382,9 @@ def _is_loop_hint(hint) -> bool:
 
 
 def _beat_loop_size(hint) -> int | None:
-    if hint.loop_bars is None:
+    if hint.loop_beats is None:
         return None
-    beats = int(hint.loop_bars) * 4
+    beats = int(hint.loop_beats)
     if beats <= 0:
         return None
     return beats * 65536 + 1

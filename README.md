@@ -37,7 +37,7 @@ The auto cue layout is designed for fast house and tech-house prep:
 | E | Exit Loop | Clean outro/exit loop when the analyzer finds one |
 | Memory | Outro | Basic late-track memory cue |
 
-D and E are conservative. The analyzer prefers clean 4 or 8 bar loops and skips a loop when the section looks unstable, faded, or transition-heavy. Bad automatic loops are worse than missing loops.
+D and E are conservative. The analyzer prefers clean 4 or 8 beat loops snapped to beat-grid lines, and skips a loop when the section looks unstable, faded, or transition-heavy. Bad automatic loops are worse than missing loops.
 
 ## Install
 

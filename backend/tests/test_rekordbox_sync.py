@@ -45,11 +45,11 @@ def test_cue_kind_maps_hotcue_slots_to_rekordbox_kinds():
     assert _cue_kind(CueHint("E", 1.0, "hot", 4)) == 6
     assert _cue_kind(CueHint("Memory", 1.0, "memory", None)) == 0
     assert _cue_kind(CueHint("Bad", 1.0, "hot", 8)) is None
-    assert _cue_kind(CueHint("Intro Loop", 1.0, "loop", 3, 17.0, 8)) == 5
+    assert _cue_kind(CueHint("Intro Loop", 1.0, "loop", 3, 5.0, 8)) == 5
 
 
 def test_beat_loop_size_uses_rekordbox_encoding():
-    assert _beat_loop_size(CueHint("Loop", 1.0, "loop", 1, 33.0, 16)) == 4194305
+    assert _beat_loop_size(CueHint("Loop", 1.0, "loop", 1, 5.0, 8)) == 524289
 
 
 def test_sync_cue_hints_adds_missing_hot_and_memory_cues():
@@ -108,8 +108,8 @@ def test_sync_cue_hints_adds_loop_rows_with_rekordbox_loop_fields():
     features = _features(
         [
             CueHint("Intro", 0.5, "hot", 0),
-            CueHint("Intro Loop", 0.5, "loop", 3, 32.5, 16),
-            CueHint("Exit Loop", 180.0, "loop", 4, 212.0, 16),
+            CueHint("Intro Loop", 0.5, "loop", 3, 4.5, 8),
+            CueHint("Exit Loop", 180.0, "loop", 4, 184.0, 8),
         ]
     )
 
@@ -122,19 +122,19 @@ def test_sync_cue_hints_adds_loop_rows_with_rekordbox_loop_fields():
     assert [cue.Kind for cue in db.added] == [1, 5, 6]
     intro_loop = db.added[1]
     assert intro_loop.InMsec == 500
-    assert intro_loop.OutMsec == 32500
+    assert intro_loop.OutMsec == 4500
     assert intro_loop.CueMicrosec == 0
     assert intro_loop.Color == 255
     assert intro_loop.ColorTableIndex == 0
     assert intro_loop.ActiveLoop == 0
-    assert intro_loop.BeatLoopSize == 4194305
+    assert intro_loop.BeatLoopSize == 524289
 
 
 def test_sync_cue_hints_skips_loop_when_hotcue_slot_exists():
     existing = [SimpleNamespace(Kind=5, InMsec=500, Comment="Manual Loop")]
     db = FakeDb(existing)
     content = SimpleNamespace(ID="track-1", UUID="uuid-1", HotCueAutoLoad=None, CueUpdated="1", Commnt="")
-    features = _features([CueHint("Intro Loop", 0.5, "loop", 3, 32.5, 16)])
+    features = _features([CueHint("Intro Loop", 0.5, "loop", 3, 4.5, 8)])
 
     added, skipped, added_loops, skipped_loops = _sync_cue_hints(db, content, features)
 
@@ -167,8 +167,8 @@ def test_sync_cue_hints_replaces_old_soundcloud_dl_auto_cues():
             CueHint("Intro", 0.5, "hot", 0),
             CueHint("Phrase 16", 30.0, "hot", 1),
             CueHint("Phrase 32", 60.0, "hot", 2),
-            CueHint("Intro Loop", 0.5, "loop", 3, 32.5, 16),
-            CueHint("Exit Loop", 180.0, "loop", 4, 212.0, 16),
+            CueHint("Intro Loop", 0.5, "loop", 3, 4.5, 8),
+            CueHint("Exit Loop", 180.0, "loop", 4, 184.0, 8),
         ]
     )
 
@@ -185,7 +185,7 @@ def test_sync_cue_hints_replaces_old_soundcloud_dl_auto_cues():
 
 def test_rekordbox_xml_writes_loop_marks(tmp_path):
     out = tmp_path / "rekordbox.xml"
-    features = _features([CueHint("Intro Loop", 0.5, "loop", 3, 32.5, 16)])
+    features = _features([CueHint("Intro Loop", 0.5, "loop", 3, 4.5, 8)])
 
     write_rekordbox_xml([features], out)
 
@@ -195,7 +195,7 @@ def test_rekordbox_xml_writes_loop_marks(tmp_path):
     assert mark.attrib["Name"] == "Intro Loop"
     assert mark.attrib["Type"] == "4"
     assert mark.attrib["Start"] == "0.5"
-    assert mark.attrib["End"] == "32.5"
+    assert mark.attrib["End"] == "4.5"
     assert mark.attrib["Num"] == "3"
 
 

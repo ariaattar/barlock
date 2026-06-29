@@ -11,7 +11,7 @@ import numpy as np
 import soundfile as sf
 
 AUDIO_EXTS = {".mp3", ".wav", ".aiff", ".aif", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
-ANALYSIS_VERSION = 5
+ANALYSIS_VERSION = 6
 
 NOTE_NAMES = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 MAJOR_PROFILE = np.asarray([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
@@ -54,7 +54,7 @@ class CueHint:
     kind: str = "memory"
     hotcue_slot: int | None = None
     end_seconds: float | None = None
-    loop_bars: int | None = None
+    loop_beats: int | None = None
 
 
 @dataclass(frozen=True)
@@ -351,7 +351,7 @@ def _cue_hints(
         if key in seen:
             continue
         seen.add(key)
-        cues.append(CueHint(cue.name, seconds, cue.kind, cue.hotcue_slot, end_seconds, cue.loop_bars))
+        cues.append(CueHint(cue.name, seconds, cue.kind, cue.hotcue_slot, end_seconds, cue.loop_beats))
     return cues
 
 
@@ -447,13 +447,13 @@ def _best_exit_loop_candidate(
     bar: float,
     first_downbeat: float,
     loop_profile: LoopProfile,
-    preferred_loop_bars: int | None = None,
+    preferred_loop_beats: int | None = None,
 ) -> tuple[float, float, int] | None:
     if bar <= 0 or duration <= bar * 8:
         return None
 
-    candidate_bars = _loop_bar_options(duration, bar, preferred_loop_bars=preferred_loop_bars)
-    if not candidate_bars:
+    candidate_beats = _loop_beat_options(duration, bar, preferred_loop_beats=preferred_loop_beats)
+    if not candidate_beats:
         return None
 
     keepout = min(8 * bar, max(4 * bar, duration * 0.05))
@@ -466,7 +466,7 @@ def _best_exit_loop_candidate(
         first_downbeat=first_downbeat,
         earliest=earliest,
         latest_end=latest_end,
-        candidate_bars=candidate_bars,
+        candidate_beats=candidate_beats,
         role="exit",
     )
     best = _select_loop_candidate(candidates)
@@ -485,8 +485,8 @@ def _best_intro_loop_candidate(
     if bar <= 0 or duration <= bar * 8:
         return None
 
-    candidate_bars = _loop_bar_options(duration, bar)
-    if not candidate_bars:
+    candidate_beats = _loop_beat_options(duration, bar)
+    if not candidate_beats:
         return None
 
     earliest = max(first_downbeat + 4 * bar, _profile_start(loop_profile) + bar)
@@ -503,7 +503,7 @@ def _best_intro_loop_candidate(
         first_downbeat=first_downbeat,
         earliest=earliest,
         latest_end=latest_end,
-        candidate_bars=candidate_bars,
+        candidate_beats=candidate_beats,
         role="intro",
     )
     best = _select_loop_candidate(candidates)
@@ -520,36 +520,35 @@ def _search_loop_candidates(
     first_downbeat: float,
     earliest: float,
     latest_end: float,
-    candidate_bars: list[int],
+    candidate_beats: list[int],
     role: str,
 ) -> list[tuple[float, float, int, float]]:
     if latest_end <= earliest:
         return []
 
     candidates: list[tuple[float, float, int, float]] = []
-    anchors = _bar_phase_anchors(first_downbeat, bar)
-    for anchor in anchors:
-        search_start = _snap_up_to_bar(earliest, anchor, bar)
-        search_end = _snap_down_to_bar(latest_end, anchor, bar)
-        if search_end <= search_start:
-            continue
+    beat = bar / 4.0
+    search_start = _snap_up_to_beat(earliest, first_downbeat, beat)
+    search_end = _snap_down_to_beat(latest_end, first_downbeat, beat)
+    if search_end <= search_start:
+        return []
 
-        for bars in candidate_bars:
-            loop_len = bars * bar
-            start = search_start
-            while start + loop_len <= search_end + 0.001:
-                end = start + loop_len
-                score = _loop_candidate_score(
-                    profile,
-                    start=start,
-                    end=end,
-                    bar=bar,
-                    duration=duration,
-                    role=role,
-                )
-                if score is not None and score >= _loop_acceptance_threshold(bars):
-                    candidates.append((start, end, bars, score))
-                start += bar
+    for beats in candidate_beats:
+        loop_len = beats * beat
+        start = search_start
+        while start + loop_len <= search_end + 0.001:
+            end = start + loop_len
+            score = _loop_candidate_score(
+                profile,
+                start=start,
+                end=end,
+                bar=bar,
+                duration=duration,
+                role=role,
+            )
+            if score is not None and score >= _loop_acceptance_threshold(beats):
+                candidates.append((start, end, beats, score))
+            start += beat
     return candidates
 
 
@@ -557,44 +556,37 @@ def _select_loop_candidate(candidates: list[tuple[float, float, int, float]]) ->
     if not candidates:
         return None
 
-    best_by_bars: dict[int, tuple[float, float, int, float]] = {}
+    best_by_beats: dict[int, tuple[float, float, int, float]] = {}
     for candidate in sorted(candidates, key=lambda item: item[3], reverse=True):
-        best_by_bars.setdefault(candidate[2], candidate)
+        best_by_beats.setdefault(candidate[2], candidate)
 
-    best_4 = best_by_bars.get(4)
-    best_8 = best_by_bars.get(8)
-    best_16 = best_by_bars.get(16)
+    best_4 = best_by_beats.get(4)
+    best_8 = best_by_beats.get(8)
     if best_8 is not None and (best_4 is None or best_8[3] >= best_4[3] - 0.06):
-        chosen = best_8
+        return best_8
     elif best_4 is not None:
-        chosen = best_4
-    else:
-        chosen = max(candidates, key=lambda item: item[3])
-
-    if best_16 is not None and best_16[3] >= 0.86 and best_16[3] >= chosen[3] + 0.08:
-        return best_16
-    return chosen
+        return best_4
+    return max(candidates, key=lambda item: item[3])
 
 
-def _loop_bar_options(duration: float, bar: float, *, preferred_loop_bars: int | None = None) -> list[int]:
+def _loop_beat_options(duration: float, bar: float, *, preferred_loop_beats: int | None = None) -> list[int]:
     if bar <= 0:
         return []
-    order = (8, 4, 16)
-    maximum = preferred_loop_bars or 16
+    beat = bar / 4.0
+    order = (8, 4)
+    maximum = preferred_loop_beats or 8
     options = [
-        bars
-        for bars in order
-        if bars <= maximum and duration >= bars * bar * 2.5
+        beats
+        for beats in order
+        if beats <= maximum and duration >= beats * beat * 2.5
     ]
     return list(dict.fromkeys(options))
 
 
-def _loop_acceptance_threshold(bars: int) -> float:
-    if bars >= 16:
-        return 0.82
-    if bars >= 8:
-        return 0.72
-    return 0.66
+def _loop_acceptance_threshold(beats: int) -> float:
+    if beats >= 8:
+        return 0.68
+    return 0.62
 
 
 def _loop_candidate_score(
@@ -688,8 +680,9 @@ def _loop_candidate_score(
     groove_score = 0.70 * bar_consistency + 0.30 * half_match
     timbre_score = 0.70 * feature_match + 0.30 * half_match
     clean_transition = 1.0 - fill_penalty
-    length_bars = int(round(max(1.0, (end - start) / max(bar, 1e-6))))
-    length_bias = {4: 1.0, 8: 0.985, 16: 0.94}.get(length_bars, 0.96)
+    beat = bar / 4.0
+    length_beats = int(round(max(1.0, (end - start) / max(beat, 1e-6))))
+    length_bias = {4: 1.0, 8: 0.985}.get(length_beats, 0.96)
 
     score = (
         0.25 * groove_score
@@ -772,12 +765,6 @@ def _profile_end(profile: LoopProfile) -> float:
     if profile.sample_rate > 0:
         return float(profile.offset_sec + len(profile.y) / profile.sample_rate)
     return float(profile.offset_sec)
-
-
-def _bar_phase_anchors(first_downbeat: float, bar: float) -> list[float]:
-    beat = bar / 4.0 if bar > 0 else 0.0
-    anchors = [max(0.0, first_downbeat + beat * phase) for phase in range(4)]
-    return list(dict.fromkeys(round(anchor, 6) for anchor in anchors))
 
 
 def _ratio_db(numerator: float, denominator: float) -> float:
@@ -980,6 +967,20 @@ def _snap_up_to_bar(value: float, first_downbeat: float, bar: float) -> float:
     return first_downbeat + bars * bar
 
 
+def _snap_down_to_beat(value: float, first_downbeat: float, beat: float) -> float:
+    if beat <= 0 or value <= first_downbeat:
+        return max(0.0, value)
+    beats = math.floor((value - first_downbeat) / beat)
+    return first_downbeat + beats * beat
+
+
+def _snap_up_to_beat(value: float, first_downbeat: float, beat: float) -> float:
+    if beat <= 0 or value <= first_downbeat:
+        return max(0.0, value)
+    beats = math.ceil((value - first_downbeat) / beat)
+    return first_downbeat + beats * beat
+
+
 def _moving_average(values: np.ndarray, width: int) -> np.ndarray:
     if width <= 1 or values.size < width:
         return values
@@ -1032,7 +1033,14 @@ def _features_to_dict(features: TrackFeatures) -> dict:
 def _features_from_json(text: str) -> TrackFeatures:
     data = json.loads(text)
     data["analysis_version"] = int(data.get("analysis_version", 0) or 0)
-    data["cue_hints"] = [CueHint(**cue) for cue in data.get("cue_hints", [])]
+    cue_hints = []
+    for cue in data.get("cue_hints", []):
+        if "loop_bars" in cue and "loop_beats" not in cue:
+            cue["loop_beats"] = int(cue.pop("loop_bars") or 0) * 4 or None
+        else:
+            cue.pop("loop_bars", None)
+        cue_hints.append(CueHint(**cue))
+    data["cue_hints"] = cue_hints
     return TrackFeatures(**data)
 
 
@@ -1071,6 +1079,8 @@ def _cue_layout_is_current(cues: list[CueHint]) -> bool:
         if cue is None:
             continue
         if cue.kind != kind or cue.hotcue_slot != slot or cue.end_seconds is None:
+            return False
+        if cue.loop_beats not in {4, 8}:
             return False
     return True
 
