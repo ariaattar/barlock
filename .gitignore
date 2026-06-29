@@ -12,8 +12,6 @@ backend/uv.lock
 backend/bin/
 backend/downloads/
 backend/dist/
-backend/tests/fixtures/*.wav
-backend/tests/fixtures/*.decoded.wav
 
 # OS / editor
 .DS_Store
