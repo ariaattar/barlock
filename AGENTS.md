@@ -55,7 +55,7 @@ The expected cue layout is:
 - E: `Exit Loop`
 - Memory: `Outro`
 
-D and E loops should be conservative. Prefer clean 4 or 8 beat loops snapped to beat-grid lines. Skip loops that look unstable, faded, off-grid, or transition-heavy.
+D and E loops should be conservative. Prefer clean 4 or 8 beat loops that start and end on bar-one/downbeat grid lines. Skip loops that look unstable, faded, off-grid, or transition-heavy.
 
 If loop selection changes, bump `ANALYSIS_VERSION` in `backend/app/audio_features.py` so cached cue hints are regenerated.
 

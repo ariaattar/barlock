@@ -11,7 +11,7 @@ import numpy as np
 import soundfile as sf
 
 AUDIO_EXTS = {".mp3", ".wav", ".aiff", ".aif", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
-ANALYSIS_VERSION = 6
+ANALYSIS_VERSION = 7
 
 NOTE_NAMES = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 MAJOR_PROFILE = np.asarray([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
@@ -527,12 +527,12 @@ def _search_loop_candidates(
         return []
 
     candidates: list[tuple[float, float, int, float]] = []
-    beat = bar / 4.0
-    search_start = _snap_up_to_beat(earliest, first_downbeat, beat)
-    search_end = _snap_down_to_beat(latest_end, first_downbeat, beat)
+    search_start = _snap_up_to_bar(earliest, first_downbeat, bar)
+    search_end = _snap_down_to_bar(latest_end, first_downbeat, bar)
     if search_end <= search_start:
         return []
 
+    beat = bar / 4.0
     for beats in candidate_beats:
         loop_len = beats * beat
         start = search_start
@@ -548,7 +548,7 @@ def _search_loop_candidates(
             )
             if score is not None and score >= _loop_acceptance_threshold(beats):
                 candidates.append((start, end, beats, score))
-            start += beat
+            start += bar
     return candidates
 
 

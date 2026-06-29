@@ -70,11 +70,15 @@ def test_auto_cue_hints_write_scored_intro_and_exit_loops():
     assert intro_loop.loop_beats in {4, 8}
     assert _is_beat_grid_line(intro_loop.seconds, first_downbeat=0.5, beat=0.5)
     assert _is_beat_grid_line(intro_loop.end_seconds, first_downbeat=0.5, beat=0.5)
+    assert _is_bar_grid_line(intro_loop.seconds, first_downbeat=0.5, bar=2.0)
+    assert _is_bar_grid_line(intro_loop.end_seconds, first_downbeat=0.5, bar=2.0)
     assert exit_loop.hotcue_slot == 4
     assert exit_loop.end_seconds <= 214.5
     assert exit_loop.loop_beats in {4, 8}
     assert _is_beat_grid_line(exit_loop.seconds, first_downbeat=0.5, beat=0.5)
     assert _is_beat_grid_line(exit_loop.end_seconds, first_downbeat=0.5, beat=0.5)
+    assert _is_bar_grid_line(exit_loop.seconds, first_downbeat=0.5, bar=2.0)
+    assert _is_bar_grid_line(exit_loop.end_seconds, first_downbeat=0.5, bar=2.0)
 
 
 def test_exit_loop_candidate_avoids_tail_fade_and_uses_stable_audio():
@@ -102,6 +106,34 @@ def test_exit_loop_candidate_avoids_tail_fade_and_uses_stable_audio():
     assert bars in {4, 8}
     assert _is_beat_grid_line(start, first_downbeat=0.5, beat=0.5)
     assert _is_beat_grid_line(end, first_downbeat=0.5, beat=0.5)
+    assert _is_bar_grid_line(start, first_downbeat=0.5, bar=2.0)
+    assert _is_bar_grid_line(end, first_downbeat=0.5, bar=2.0)
+
+
+def test_exit_loop_candidate_starts_on_bar_one_not_beat_four():
+    duration = 128.0
+    first_downbeat = 0.5
+    bar = 2.0
+    times = np.linspace(0.0, duration, 257)
+    rms = np.full(times.shape, 0.12)
+    rms[(times >= 64.0) & (times <= 108.0)] = 0.78
+    profile = _profile_from_rms(duration, times, rms)
+
+    candidate = _best_exit_loop_candidate(
+        duration=duration,
+        bar=bar,
+        first_downbeat=first_downbeat,
+        preferred_loop_beats=4,
+        loop_profile=profile,
+    )
+
+    assert candidate is not None
+    start, end, beats = candidate
+    assert beats == 4
+    assert _is_bar_grid_line(start, first_downbeat=first_downbeat, bar=bar)
+    assert _is_bar_grid_line(end, first_downbeat=first_downbeat, bar=bar)
+    beat_index = round((start - first_downbeat) / (bar / 4.0))
+    assert beat_index % 4 == 0
 
 
 def test_intro_loop_candidate_skips_silent_opening():
@@ -125,6 +157,8 @@ def test_intro_loop_candidate_skips_silent_opening():
     assert bars in {4, 8}
     assert _is_beat_grid_line(start, first_downbeat=0.5, beat=0.5)
     assert _is_beat_grid_line(end, first_downbeat=0.5, beat=0.5)
+    assert _is_bar_grid_line(start, first_downbeat=0.5, bar=2.0)
+    assert _is_bar_grid_line(end, first_downbeat=0.5, bar=2.0)
 
 
 def test_loop_candidate_rejects_final_bar_fill():
@@ -215,3 +249,7 @@ def _profile_from_rms(duration: float, times: np.ndarray, rms: np.ndarray) -> Lo
 
 def _is_beat_grid_line(value: float, *, first_downbeat: float, beat: float) -> bool:
     return abs(round((value - first_downbeat) / beat) - ((value - first_downbeat) / beat)) < 0.002
+
+
+def _is_bar_grid_line(value: float, *, first_downbeat: float, bar: float) -> bool:
+    return abs(round((value - first_downbeat) / bar) - ((value - first_downbeat) / bar)) < 0.002
