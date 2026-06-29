@@ -3,10 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 from app.audio_features import TrackFeatures
+from app import soundcloud_bridge as bridge
 from app import soundcloud_cli as cli
+from app.soundcloud_common import features_to_dict
 from app.soundcloud_config import AppConfig
 from app.soundcloud_downloader import DownloadEntry, DownloadPlan
 
@@ -82,35 +82,21 @@ def test_archive_is_source_specific_and_seeded_from_legacy(tmp_path):
     assert archive.read_text() == "soundcloud 123\n"
 
 
-def test_selector_fallback_accepts_number(monkeypatch, tmp_path):
-    app = cli.TerminalApp(AppConfig(output_dir=str(tmp_path)))
-    monkeypatch.setattr(app, "_interactive_selector_available", lambda: False)
-    monkeypatch.setattr(cli.Prompt, "ask", lambda *args, **kwargs: "2")
+def test_no_arg_python_cli_points_to_opentui_launcher(monkeypatch, capsys, tmp_path):
+    cfg = AppConfig(output_dir=str(tmp_path), archive_path=str(tmp_path / ".archive"))
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
 
-    choice = app._select_option("Choose", [("One", "one"), ("Two", "two")])
+    assert cli.main([]) == 0
 
-    assert choice == "two"
-
-
-def test_selector_fallback_supports_back(monkeypatch, tmp_path):
-    app = cli.TerminalApp(AppConfig(output_dir=str(tmp_path)))
-    monkeypatch.setattr(app, "_interactive_selector_available", lambda: False)
-    monkeypatch.setattr(cli.Prompt, "ask", lambda *args, **kwargs: "b")
-
-    with pytest.raises(cli.BackRequested):
-        app._select_option("Choose", [("One", "one")])
+    assert "OpenTUI" in capsys.readouterr().out
 
 
-def test_push_features_can_close_rekordbox_then_continue(monkeypatch, tmp_path):
-    app = cli.TerminalApp(AppConfig(output_dir=str(tmp_path)))
-    running = {"value": True}
+def test_bridge_push_uses_payload_features(monkeypatch, tmp_path):
     pushed: dict[str, object] = {}
-
-    def fake_close_rekordbox():
-        running["value"] = False
-        return True
+    emitted: list[tuple[str, dict[str, object]]] = []
 
     def fake_push(features, *, playlist_name, create_playlist, playlist_id=None):
+        pushed["tracks"] = [item.title for item in features]
         pushed["playlist_name"] = playlist_name
         pushed["create_playlist"] = create_playlist
         pushed["playlist_id"] = playlist_id
@@ -127,15 +113,27 @@ def test_push_features_can_close_rekordbox_then_continue(monkeypatch, tmp_path):
             backup_dir=tmp_path / "backup",
         )
 
-    monkeypatch.setattr(cli, "rekordbox_running", lambda: running["value"])
-    monkeypatch.setattr(cli, "close_rekordbox", fake_close_rekordbox)
-    monkeypatch.setattr(app, "_prompt_confirm", lambda *args, **kwargs: True)
-    monkeypatch.setattr(app, "_choose_playlist", lambda default_playlist_name=None: ("Set", True, None))
-    monkeypatch.setattr(cli, "push_tracks_to_playlist", fake_push)
+    monkeypatch.setattr(
+        bridge,
+        "_load_payload",
+        lambda _payload: {
+            "features": [features_to_dict(_features(tmp_path / "track.mp3"))],
+            "playlist_name": "Set",
+            "create_playlist": True,
+        },
+    )
+    monkeypatch.setattr(bridge, "push_tracks_to_playlist", fake_push)
+    monkeypatch.setattr(bridge, "_emit", lambda event, **payload: emitted.append((event, payload)))
 
-    app._push_features([_features(tmp_path / "track.mp3")], default_playlist_name="Set", output_dir=tmp_path)
+    assert bridge._cmd_push(SimpleNamespace(payload="-")) == 0
 
-    assert pushed == {"playlist_name": "Set", "create_playlist": True, "playlist_id": None}
+    assert pushed == {
+        "tracks": ["Track"],
+        "playlist_name": "Set",
+        "create_playlist": True,
+        "playlist_id": None,
+    }
+    assert emitted[-1][0] == "done"
 
 
 def _features(path: Path) -> TrackFeatures:

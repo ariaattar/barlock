@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import threading
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -60,7 +61,7 @@ class _YtdlpLogger:
             print(f"warning: {msg}")
 
     def error(self, msg: str) -> None:
-        print(f"error: {msg}")
+        print(f"error: {msg}", file=sys.stderr)
 
 
 def validate_soundcloud_url(url: str) -> str:

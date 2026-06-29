@@ -1,6 +1,6 @@
 # SoundCloud DL for Rekordbox
 
-Interactive SoundCloud downloader, audio analyzer, and Rekordbox playlist importer for DJ prep.
+OpenTUI SoundCloud downloader, audio analyzer, and Rekordbox playlist importer for DJ prep.
 
 The main entrypoint is:
 
@@ -23,6 +23,7 @@ Use it to pull SoundCloud tracks, public playlists, or likes, analyze the local 
 - Pushes directly into an existing or new Rekordbox playlist
 - Picks up the SoundCloud playlist title as the default Rekordbox playlist name
 - Backs up Rekordbox database files before direct database writes
+- Uses an OpenTUI interactive terminal app with arrow-key menus and back navigation
 
 ## Cue Layout
 
@@ -46,6 +47,7 @@ From the repo root:
 ```bash
 cd backend
 uv sync
+cd tui && bun install && cd ..
 go build -o bin/soundcloud-dl ./cmd/soundcloud-dl
 ln -sfn "$(pwd)/bin/soundcloud-dl" /opt/homebrew/bin/soundcloud-dl
 ```
@@ -55,10 +57,11 @@ Requirements:
 - macOS
 - Python 3.10 to 3.12
 - `uv`
+- Bun, for the OpenTUI interactive app
 - Go, only for rebuilding the launcher binary
 - Rekordbox 6 database available at `~/Library/Pioneer/rekordbox`
 
-The launcher runs `uv run python -m app.soundcloud_cli` from the backend directory.
+The launcher starts `backend/tui` for interactive use and keeps `uv run python -m app.soundcloud_cli` for URL/subcommand shortcuts.
 
 ## Usage
 
@@ -68,7 +71,7 @@ Start the interactive terminal UI:
 soundcloud-dl
 ```
 
-Interactive menus support arrow keys, Enter to select, `b` to go back, and `q` to quit where available.
+Interactive menus support Up/Down, Enter to select, Escape/Left/`b` to go back, and `q` to quit from menus. Text fields use Escape/Left for back so normal folder names and URLs can include any letters.
 
 Typical flow:
 
@@ -146,6 +149,7 @@ Backend setup:
 ```bash
 cd backend
 uv sync
+cd tui && bun install && bun run check && bun run smoke && cd ..
 uv run pytest -q
 ```
 
@@ -159,14 +163,16 @@ go build -o bin/soundcloud-dl ./cmd/soundcloud-dl
 Run the CLI without rebuilding:
 
 ```bash
-cd backend
-uv run python -m app.soundcloud_cli
+cd backend/tui
+bun run start
 ```
 
 ## Project Layout
 
 ```text
-backend/app/soundcloud_cli.py         Interactive terminal UI
+backend/tui/src/main.ts               OpenTUI interactive terminal UI
+backend/app/soundcloud_bridge.py      JSON bridge used by the TUI
+backend/app/soundcloud_cli.py         Plain Python URL/subcommand backend
 backend/app/soundcloud_downloader.py  SoundCloud expansion and parallel downloads
 backend/app/audio_features.py         BPM/key/energy/cue and loop analysis
 backend/app/rekordbox_sync.py         Rekordbox import files and direct DB push

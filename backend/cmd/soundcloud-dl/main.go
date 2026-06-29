@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 func main() {
@@ -15,13 +16,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	uv, err := exec.LookPath("uv")
+	if shouldLaunchTUI(os.Args[1:]) {
+		runTUI(backendDir)
+		return
+	}
+
+	runPythonCLI(backendDir, os.Args[1:])
+}
+
+func runPythonCLI(backendDir string, cliArgs []string) {
+	uv, err := lookPath("uv")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: uv is required on PATH")
 		os.Exit(1)
 	}
 
-	args := append([]string{"run", "python", "-m", "app.soundcloud_cli"}, os.Args[1:]...)
+	args := append([]string{"run", "python", "-m", "app.soundcloud_cli"}, cliArgs...)
 	cmd := exec.Command(uv, args...)
 	cmd.Dir = backendDir
 	cmd.Stdin = os.Stdin
@@ -29,6 +39,27 @@ func main() {
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(), "PATH="+launcherPath())
 
+	runCommand(cmd)
+}
+
+func runTUI(backendDir string) {
+	bun, err := lookPath("bun")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: bun is required for interactive OpenTUI mode")
+		os.Exit(1)
+	}
+
+	cmd := exec.Command(bun, "src/main.ts")
+	cmd.Dir = filepath.Join(backendDir, "tui")
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), "PATH="+launcherPath())
+
+	runCommand(cmd)
+}
+
+func runCommand(cmd *exec.Cmd) {
 	if err := cmd.Run(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -37,6 +68,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+func shouldLaunchTUI(args []string) bool {
+	return len(args) == 0 || (len(args) == 1 && (args[0] == "--interactive" || args[0] == "-i"))
 }
 
 func findBackendDir() (string, error) {
@@ -72,7 +107,7 @@ func findBackendDir() (string, error) {
 		}
 	}
 
-	return "", errors.New("could not find backend/app/soundcloud_cli.py; set MIXER_BACKEND_DIR")
+	return "", errors.New("could not find backend app; set MIXER_BACKEND_DIR")
 }
 
 func executablePaths(exe string) []string {
@@ -95,12 +130,31 @@ func validateBackendDir(dir string) (string, error) {
 	if stat.IsDir() {
 		return "", errors.New("soundcloud_cli.py is a directory")
 	}
+	if _, err := os.Stat(filepath.Join(abs, "tui", "src", "main.ts")); err != nil {
+		return "", err
+	}
 	return abs, nil
+}
+
+func lookPath(name string) (string, error) {
+	if path, err := exec.LookPath(name); err == nil {
+		return path, nil
+	}
+	for _, dir := range strings.Split(launcherPath(), string(os.PathListSeparator)) {
+		if dir == "" {
+			continue
+		}
+		candidate := filepath.Join(dir, name)
+		if stat, err := os.Stat(candidate); err == nil && !stat.IsDir() && stat.Mode()&0111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("%s not found", name)
 }
 
 func launcherPath() string {
 	path := os.Getenv("PATH")
-	for _, extra := range []string{"/opt/homebrew/bin", "/usr/local/bin"} {
+	for _, extra := range []string{"/opt/homebrew/bin", "/usr/local/bin", filepath.Join(os.Getenv("HOME"), ".bun", "bin")} {
 		if _, err := os.Stat(extra); err == nil {
 			path = extra + string(os.PathListSeparator) + path
 		}

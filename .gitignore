@@ -12,6 +12,7 @@ backend/uv.lock
 backend/bin/
 backend/downloads/
 backend/dist/
+backend/tui/node_modules/
 
 # OS / editor
 .DS_Store

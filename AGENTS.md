@@ -8,7 +8,9 @@ This repo is now focused on the SoundCloud/Rekordbox prep tool. The web frontend
 
 Core files:
 
-- `backend/app/soundcloud_cli.py` - interactive terminal interface
+- `backend/tui/src/main.ts` - OpenTUI interactive terminal interface
+- `backend/app/soundcloud_bridge.py` - JSON bridge for the TUI
+- `backend/app/soundcloud_cli.py` - plain Python URL/subcommand backend
 - `backend/app/soundcloud_downloader.py` - SoundCloud URL expansion and downloads
 - `backend/app/audio_features.py` - BPM, key, energy, cue, and loop analysis
 - `backend/app/rekordbox_sync.py` - Rekordbox import and direct database sync
@@ -22,7 +24,7 @@ Use these from `backend/` unless noted otherwise:
 ```bash
 uv sync
 uv run pytest -q
-uv run python -m app.soundcloud_cli
+cd tui && bun install && bun run check && bun run smoke
 go build -o bin/soundcloud-dl ./cmd/soundcloud-dl
 ```
 
@@ -39,7 +41,7 @@ ln -sfn /Users/ariaattar/Documents/Documents/Code/mixer/backend/bin/soundcloud-d
 - Direct DB writes should continue to create a backup before mutating `master.db`.
 - Preserve user/manual Rekordbox cues. Only generated SoundCloud DL cues should be overwritten automatically.
 - Keep the normal user workflow interactive through `soundcloud-dl`.
-- Prefer improving the existing CLI flow over adding extra required commands.
+- Prefer improving the OpenTUI flow over adding extra required commands.
 
 ## Analysis And Cue Behavior
 
@@ -74,7 +76,8 @@ If the launcher changes:
 
 ```bash
 go build -o bin/soundcloud-dl ./cmd/soundcloud-dl
-printf 'q\n' | ./bin/soundcloud-dl
+./bin/soundcloud-dl --help
+cd tui && bun run check && bun run smoke
 ```
 
 ## Git Notes
