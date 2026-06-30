@@ -14,7 +14,7 @@ import numpy as np
 import soundfile as sf
 
 AUDIO_EXTS = {".mp3", ".wav", ".aiff", ".aif", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
-ANALYSIS_VERSION = 11
+ANALYSIS_VERSION = 12
 ENERGY_CURVE_BINS = 256
 
 NOTE_NAMES = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
@@ -270,7 +270,9 @@ def _analyze_uncached(path: Path, *, extract_vocal_stems: bool = False) -> Track
     source_id = _source_id_from_filename(path)
     file_info = sf.info(str(path))
     full_duration = float(file_info.duration)
-    analysis_duration = min(full_duration, 180.0) if full_duration > 0 else None
+    # 480s = 8 minutes covers radio edits, club edits, and most extended mixes.
+    # Truly long progressive tracks (>8min) still get the full first 8 min.
+    analysis_duration = min(full_duration, 480.0) if full_duration > 0 else None
     y, sr = librosa.load(str(path), sr=22050, mono=True, duration=analysis_duration)
     if y.size == 0:
         raise ValueError(f"empty audio file: {path}")
@@ -321,6 +323,7 @@ def _analyze_uncached(path: Path, *, extract_vocal_stems: bool = False) -> Track
         sections=sections,
         segmentation_mode=segmentation_mode,
         energy_curve=energy_curve,
+        analysis_duration=bundle.duration_analysis,
     )
 
     return TrackFeatures(
@@ -830,6 +833,56 @@ def _build_energy_curve(bundle: _FeatureBundle) -> list[float]:
     return [float(v) for v in out]
 
 
+def _build_subbass_curve(bundle: _FeatureBundle, *, bins: int = ENERGY_CURVE_BINS) -> np.ndarray:
+    """Per-bin sub-bass (<120Hz) RMS curve.
+
+    Empirically the single best feature for distinguishing dance-music drops
+    (kick + sub present) from builds (kick filtered out). Returned at the same
+    resolution as the energy curve so section sampling stays index-aligned.
+    """
+    if bundle.duration_analysis <= 0 or bundle.sr <= 0 or bundle.y.size == 0:
+        return np.zeros(bins, dtype=float)
+    import librosa
+
+    try:
+        S = np.abs(librosa.stft(bundle.y, n_fft=2048, hop_length=bundle.hop))
+        freqs = librosa.fft_frequencies(sr=bundle.sr, n_fft=2048)
+        band = S[freqs < 120.0]
+        if band.size == 0:
+            return np.zeros(bins, dtype=float)
+        # Per-frame sub-bass energy, smoothed.
+        sub_frames = np.sqrt(np.mean(np.square(band), axis=0))
+        sub_frames = _moving_average(sub_frames, 9)
+    except Exception:
+        return np.zeros(bins, dtype=float)
+
+    duration = bundle.duration_analysis
+    seconds = np.arange(0.0, duration, 1.0)
+    if seconds.size < 4:
+        seconds = np.linspace(0.0, max(duration, 1.0), max(8, bins))
+    frame_times = librosa.frames_to_time(np.arange(sub_frames.size), sr=bundle.sr, hop_length=bundle.hop)
+    n = min(frame_times.size, sub_frames.size)
+    frame_times = frame_times[:n]
+    sub_frames = sub_frames[:n]
+
+    sec_values = np.zeros_like(seconds)
+    for idx, t in enumerate(seconds):
+        mask = (frame_times >= t) & (frame_times < t + 1.0)
+        if np.any(mask):
+            sec_values[idx] = float(np.mean(sub_frames[mask]))
+
+    # Normalize against the 95th percentile so the result lives in [0, 1] like
+    # the energy curve. Avoids absolute-amplitude bias between tracks.
+    ref = float(np.percentile(sec_values, 95)) if sec_values.size else 0.0
+    if ref <= 1e-9:
+        return np.zeros(bins, dtype=float)
+    sec_values = np.clip(sec_values / ref, 0.0, 1.0)
+
+    xs = np.linspace(0.0, 1.0, sec_values.size)
+    xt = np.linspace(0.0, 1.0, bins)
+    return np.interp(xt, xs, sec_values)
+
+
 def _safe_normalize(values: np.ndarray) -> np.ndarray:
     if values.size == 0:
         return values
@@ -874,7 +927,12 @@ def _segment_sections(
             cleaned.append(entry)
     if not cleaned or cleaned[0][0] > 0.5:
         cleaned.insert(0, (0.0, 1.0))
-    cleaned.append((bundle.duration_full, 1.0))
+    # Cap sections at the end of the analyzed audio window. For long tracks the
+    # audio past duration_analysis was never decoded, so any section that would
+    # span past that is uncertain — better to bound the last section at the
+    # analysis window and let cue placement fall back to bar-counted offsets
+    # for anything in the un-analyzed tail.
+    cleaned.append((bundle.duration_analysis, 1.0))
 
     # Build sections
     sections_raw: list[Section] = []
@@ -889,14 +947,32 @@ def _segment_sections(
     if len(sections_raw) < 3 or len(sections_raw) > 12:
         return [], 0.0, "heuristic"
 
-    # Score each section's energy by sampling the curve
-    duration = max(bundle.duration_full, 1e-6)
+    # Score each section's energy by sampling the curve. The curve covers
+    # [0, duration_analysis] — use that, not duration_full, or sections are
+    # sampled at wrong indices on tracks that were truncated to 8min.
+    curve_duration = max(bundle.duration_analysis, 1e-6)
     bins = ENERGY_CURVE_BINS
+
+    # Sub-bass RMS curve: best discriminator for drop vs build in dance music.
+    # Drops re-introduce the kick + sub-bass; builds typically high-pass them.
+    # (Yadati et al. ISMIR 2014; Zehren et al. 2020 on EDM cue-point detection.)
+    subbass_curve = _build_subbass_curve(bundle, bins=bins)
+
+    def section_window(s: Section) -> tuple[int, int]:
+        lo = int(np.clip(int(s.start_sec / curve_duration * bins), 0, bins - 1))
+        hi = int(np.clip(int(s.end_sec / curve_duration * bins), lo + 1, bins))
+        return lo, hi
+
     def section_energy(s: Section) -> float:
-        lo = int(np.clip(int(s.start_sec / duration * bins), 0, bins - 1))
-        hi = int(np.clip(int(s.end_sec / duration * bins), lo + 1, bins))
+        lo, hi = section_window(s)
         return float(np.mean(energy_curve[lo:hi])) if hi > lo else 0.0
+
+    def section_subbass(s: Section) -> float:
+        lo, hi = section_window(s)
+        return float(np.mean(subbass_curve[lo:hi])) if hi > lo else 0.0
+
     energies = [section_energy(s) for s in sections_raw]
+    subbass = [section_subbass(s) for s in sections_raw]
 
     # Label
     labels = ["section"] * len(sections_raw)
@@ -906,47 +982,67 @@ def _segment_sections(
     if not middle_idx:
         return [], 0.0, "heuristic"
 
-    middle_energies = [(i, energies[i]) for i in middle_idx]
-    middle_energies.sort(key=lambda item: item[1], reverse=True)
-    drop_idx, drop_energy = middle_energies[0]
-    drop_dominance = 0.0
-    if len(middle_energies) >= 2:
-        second_energy = middle_energies[1][1]
-        drop_dominance = max(0.0, (drop_energy / max(second_energy, 1e-6)) - 1.0)
-    # 0.10 = peak section needs only 10% more energy than the runner-up to count
-    # as "the drop." 0.25 was too strict for tech-house / dance edits where the
-    # peak and build sections often have similar RMS — those tracks ended up
-    # with no drop label and silently fell back to Phrase 32 on pad C.
+    # Combine full-band energy and sub-bass for "drop score". Sub-bass is what
+    # actually fires on a drop in dance music — it carries 60% weight here.
+    drop_score = {i: 0.4 * energies[i] + 0.6 * subbass[i] for i in middle_idx}
+    middle_by_drop = sorted(middle_idx, key=lambda i: drop_score[i], reverse=True)
+    top_drop_idx = middle_by_drop[0]
+    top_drop_score = drop_score[top_drop_idx]
+    second_drop_score = drop_score[middle_by_drop[1]] if len(middle_by_drop) >= 2 else 0.0
+    drop_dominance = max(0.0, (top_drop_score / max(second_drop_score, 1e-6)) - 1.0)
+    # 0.10 = peak section needs only 10% more sub-bass+energy than the runner-up
+    # to count as "the drop." Looser than 0.25 to catch multi-drop tech-house.
     if drop_dominance >= 0.10:
-        labels[drop_idx] = "drop"
+        labels[top_drop_idx] = "drop"
 
-    # Breakdown: lowest energy in middle, at least 8 bars long, between intro and outro
+    # Breakdown: lowest-energy middle section, at least 8 bars long. Median is
+    # computed over MIDDLE sections only — including intro/outro biases the
+    # median down (they are quieter than the body of the track) and prevents
+    # the threshold from firing on otherwise-clear breakdowns.
+    middle_median_energy = float(np.median([energies[i] for i in middle_idx]))
     breakdown_idx = min(middle_idx, key=lambda i: energies[i])
-    if breakdown_idx != drop_idx and sections_raw[breakdown_idx].end_sec - sections_raw[breakdown_idx].start_sec >= bar * 8:
-        if energies[breakdown_idx] < (np.median(energies) * 0.7):
+    if breakdown_idx != top_drop_idx and sections_raw[breakdown_idx].end_sec - sections_raw[breakdown_idx].start_sec >= bar * 8:
+        if energies[breakdown_idx] < middle_median_energy * 0.7:
             labels[breakdown_idx] = "breakdown"
 
-    # Build before drop
-    if labels[drop_idx] == "drop" and drop_idx - 1 in middle_idx:
-        pre = sections_raw[drop_idx - 1]
-        # Sample energy slope across bins of the previous section
-        lo = int(pre.start_sec / duration * bins)
-        hi = int(pre.end_sec / duration * bins)
-        slope = 0.0
-        if hi - lo > 4:
-            chunk = energy_curve[lo:hi]
-            xs = np.arange(len(chunk))
-            slope = float(np.polyfit(xs, chunk, 1)[0])
-        if slope > 0.0:
-            labels[drop_idx - 1] = "build"
-
-    # Last drop
-    if labels[drop_idx] == "drop" and drop_idx + 1 <= len(sections_raw) - 2:
-        # second-highest energy after the first drop
-        post_idx = [i for i in middle_idx if i > drop_idx]
+    # If the drop didn't dominate enough to get labeled, we may still have a
+    # breakdown — try the breakdown→build→drop triplet pattern: a section
+    # immediately after a breakdown that's significantly louder than the
+    # breakdown is the drop, even if it doesn't dominate the whole track.
+    if "drop" not in labels and "breakdown" in labels:
+        bd_idx = labels.index("breakdown")
+        post_idx = [i for i in middle_idx if i > bd_idx]
         if post_idx:
-            best_post = max(post_idx, key=lambda i: energies[i])
-            if energies[best_post] > np.median(energies) * 1.1 and best_post != drop_idx:
+            best_post = max(post_idx, key=lambda i: drop_score[i])
+            # Drop must be at least 40% louder (sub-bass+energy) than the breakdown.
+            if drop_score[best_post] > drop_score[bd_idx] * 1.4:
+                labels[best_post] = "drop"
+                top_drop_idx = best_post
+
+    # Build before drop: section immediately preceding labeled drop with a
+    # monotonically rising energy slope.
+    if "drop" in labels:
+        d_idx = labels.index("drop")
+        if d_idx - 1 in middle_idx:
+            pre = sections_raw[d_idx - 1]
+            lo, hi = section_window(pre)
+            slope = 0.0
+            if hi - lo > 4:
+                chunk = energy_curve[lo:hi]
+                xs = np.arange(len(chunk))
+                slope = float(np.polyfit(xs, chunk, 1)[0])
+            if slope > 0.0:
+                labels[d_idx - 1] = "build"
+
+    # Last drop: the highest-drop-score section AFTER the first drop, if it's
+    # at least 90% of the first drop's score (multi-drop dance music often has
+    # two near-equal peaks). On a single-drop track this stays unlabeled.
+    if "drop" in labels:
+        d_idx = labels.index("drop")
+        post_idx = [i for i in middle_idx if i > d_idx]
+        if post_idx:
+            best_post = max(post_idx, key=lambda i: drop_score[i])
+            if drop_score[best_post] >= drop_score[d_idx] * 0.90:
                 labels[best_post] = "last_drop"
 
     sections = [
@@ -1007,6 +1103,15 @@ def _compute_section_boundaries(bundle: _FeatureBundle) -> list[float]:
     except Exception:
         pass
 
+    # Allowable section count scales with track length — short edits have 3-5
+    # sections, 8-minute extended mixes can legitimately have 10+.
+    duration = float(bundle.duration_analysis)
+    min_seg = 3
+    max_seg = max(9, int(round(duration / 30.0)) + 2)
+    # Minimum bars per merged segment — suppresses micro-clusters that don't
+    # correspond to musical changes. 32 beats = 8 bars = typical phrase length.
+    min_segment_beats = 32
+
     best: list[float] = []
     best_score = -1.0
     n_beats = feats_sync.shape[1]
@@ -1028,9 +1133,12 @@ def _compute_section_boundaries(bundle: _FeatureBundle) -> list[float]:
         except Exception:
             continue
         labels = km.labels_
+        # Merge runs shorter than min_segment_beats — they're cluster noise,
+        # not section boundaries. Repeat until stable.
+        labels = _merge_short_runs(labels, min_run=min_segment_beats)
         changes = np.where(np.diff(labels) != 0)[0] + 1
         seg_count = int(changes.size + 1)
-        if not (3 <= seg_count <= 9):
+        if not (min_seg <= seg_count <= max_seg):
             continue
         # Score by mean intra-segment similarity in feats_sync (cosine)
         score = _intra_segment_similarity(feats_sync, changes)
@@ -1040,6 +1148,38 @@ def _compute_section_boundaries(bundle: _FeatureBundle) -> list[float]:
             beat_idx = np.clip(changes, 0, beat_frames.size - 1)
             best = [float(librosa.frames_to_time(beat_frames[i], sr=bundle.sr, hop_length=bundle.hop)) for i in beat_idx]
     return sorted(best)
+
+
+def _merge_short_runs(labels: np.ndarray, *, min_run: int) -> np.ndarray:
+    """Repeatedly merge any cluster-run shorter than min_run into the longer
+    of its two neighbors. Yields stable, musically-meaningful section boundaries."""
+    if labels.size == 0:
+        return labels
+    out = labels.copy()
+    while True:
+        changes = np.where(np.diff(out) != 0)[0] + 1
+        runs = []
+        prev = 0
+        for c in changes:
+            runs.append((prev, int(c)))
+            prev = int(c)
+        runs.append((prev, out.size))
+        # Find the shortest run; if it meets the threshold we're done.
+        if not runs:
+            return out
+        shortest = min(runs, key=lambda r: r[1] - r[0])
+        if shortest[1] - shortest[0] >= min_run or len(runs) <= 1:
+            return out
+        # Merge: pick neighbor with longer run (tiebreak: left).
+        idx = runs.index(shortest)
+        left_len = runs[idx - 1][1] - runs[idx - 1][0] if idx > 0 else -1
+        right_len = runs[idx + 1][1] - runs[idx + 1][0] if idx < len(runs) - 1 else -1
+        if left_len >= right_len and idx > 0:
+            out[shortest[0]:shortest[1]] = out[runs[idx - 1][0]]
+        elif idx < len(runs) - 1:
+            out[shortest[0]:shortest[1]] = out[runs[idx + 1][0]]
+        else:
+            return out
 
 
 def _laplacian_eigs(affinity: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
@@ -1250,10 +1390,15 @@ def _cue_hints(
     sections: list[Section] | None = None,
     segmentation_mode: str = "heuristic",
     energy_curve: list[float] | None = None,
+    analysis_duration: float | None = None,
 ) -> list[CueHint]:
     bar = 60.0 / bpm * 4.0 if bpm > 0 else 2.0
     sections = sections or []
     energy_curve = energy_curve or []
+    # The energy curve covers analysis_duration seconds, not necessarily the full
+    # track. If unspecified (e.g. tests that pass a curve aligned with full
+    # duration), assume the curve covers the full track.
+    curve_duration = float(analysis_duration if analysis_duration is not None else duration)
     intro_start = max(0.0, first_downbeat)
 
     structural = segmentation_mode == "structural"
@@ -1269,15 +1414,24 @@ def _cue_hints(
     last_drop_section = by_label.get("last_drop")
     outro_section = by_label.get("outro")
 
+    # The curve spans [0, curve_duration]. Pass curve_duration so the index→time
+    # mapping inside the heuristic doesn't stretch curve points across an
+    # un-analyzed tail (long-track bug).
     heuristic_breakdown_sec, heuristic_drop_sec = _heuristic_drop_breakdown(
-        duration=duration,
+        duration=curve_duration,
         bar=bar,
         first_downbeat=first_downbeat,
         energy_curve=energy_curve,
     )
 
+    # All section-derived cues must lie within the analyzed audio window —
+    # anything past curve_duration is from a stretched-time bug or low-conf
+    # extrapolation and shouldn't drive pad placement.
+    def in_window(sec: float) -> bool:
+        return sec <= curve_duration - bar * 0.5
+
     # Pad B: prefer section-labeled Build, otherwise fall back to bar*16.
-    if build_section is not None:
+    if build_section is not None and in_window(build_section.start_sec):
         pad_b_name = "Build"
         pad_b_sec = build_section.start_sec
     else:
@@ -1285,10 +1439,10 @@ def _cue_hints(
         pad_b_sec = max(0.0, first_downbeat + bar * 16)
 
     # Pad C: prefer section-labeled Drop, then heuristic energy-peak Drop, then bar*32.
-    if drop_section is not None:
+    if drop_section is not None and in_window(drop_section.start_sec):
         pad_c_name = "Drop"
         pad_c_sec = drop_section.start_sec
-    elif heuristic_drop_sec is not None:
+    elif heuristic_drop_sec is not None and in_window(heuristic_drop_sec):
         pad_c_name = "Drop"
         pad_c_sec = heuristic_drop_sec
     else:
@@ -1298,11 +1452,11 @@ def _cue_hints(
     # Pad F (slot 5): Breakdown as hot cue when we have section or energy
     # detection. Avoid clashing with a section-labeled drop on pad C — they
     # could be sourced from different bars and a Breakdown shouldn't land
-    # within a bar of the drop.
+    # within 2 bars of the drop.
     breakdown_sec: float | None = None
-    if breakdown_section is not None:
+    if breakdown_section is not None and in_window(breakdown_section.start_sec):
         breakdown_sec = breakdown_section.start_sec
-    elif heuristic_breakdown_sec is not None:
+    elif heuristic_breakdown_sec is not None and in_window(heuristic_breakdown_sec):
         breakdown_sec = heuristic_breakdown_sec
     if breakdown_sec is not None and pad_c_name == "Drop":
         if abs(breakdown_sec - pad_c_sec) < bar * 2.0:
@@ -1315,16 +1469,34 @@ def _cue_hints(
 
     # Pad G (slot 6): Last Drop only when we have section evidence — energy
     # curves don't reliably distinguish a second drop from sustained energy.
+    # Two integrity checks: must come AFTER any detected breakdown (it's
+    # definitionally post-breakdown), and must lie within the analyzed window.
+    last_drop_ok = (
+        last_drop_section is not None
+        and last_drop_section.start_sec <= curve_duration - bar
+    )
+    if last_drop_ok and breakdown_sec is not None and last_drop_section is not None:
+        if last_drop_section.start_sec <= breakdown_sec:
+            last_drop_ok = False
     pad_g = (
         CueHint("Last Drop", last_drop_section.start_sec, "hot", 6)
-        if last_drop_section is not None
+        if last_drop_ok and last_drop_section is not None
         else None
     )
 
-    # Outro: prefer section start, otherwise bar*32 from the end.
+    # Outro: prefer section start when we both have an outro section AND it
+    # falls within the analyzed window. If the labeled outro is in the
+    # un-analyzed tail of a long track, or has very low boundary confidence,
+    # fall back to the simple bar*32-from-end heuristic — empty pad is better
+    # than a confidently-wrong outro location.
+    outro_in_window = (
+        outro_section is not None
+        and outro_section.start_sec <= curve_duration - bar * 2.0
+        and outro_section.confidence >= 0.30
+    )
     outro_sec = (
         outro_section.start_sec
-        if outro_section is not None
+        if outro_in_window and outro_section is not None
         else max(0.0, duration - bar * 32)
     )
 
