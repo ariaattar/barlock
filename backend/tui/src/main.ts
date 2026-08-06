@@ -243,10 +243,15 @@ class TuiApp {
   private async mainLoop(): Promise<void> {
     while (this.running) {
       try {
-        const choice = await this.select("SoundCloud → Rekordbox Sync", [
+        const choice = await this.select("SoundCloud DL", [
+          {
+            label: "Download only",
+            description: "Track, playlist, or likes link -> folder in Downloads",
+            value: "download",
+          },
           {
             label: "Sync a SoundCloud URL",
-            description: "Set, playlist, or likes link → Rekordbox playlist",
+            description: "Download, analyze, and push -> Rekordbox playlist",
             value: "sync",
           },
           {
@@ -274,6 +279,8 @@ class TuiApp {
 
         if (choice === "quit") {
           this.running = false
+        } else if (choice === "download") {
+          await this.downloadOnlyFlow()
         } else if (choice === "sync") {
           await this.syncFlow()
         } else if (choice === "likes") {
@@ -290,6 +297,200 @@ class TuiApp {
           await this.message("Error", [errorMessage(error)], "Back")
         }
       }
+    }
+  }
+
+  private async downloadOnlyFlow(): Promise<void> {
+    const previousSubtitle = this.subtitle
+    const stepLabels = ["SoundCloud URL", "Review download", "Folder", "Confirm", "Run"]
+    const state: {
+      url: string
+      urls: string[]
+      plan?: DownloadPlan
+      outputDir?: string
+    } = {
+      url: "",
+      urls: [],
+    }
+    const updateSubtitle = () => {
+      const parts: string[] = []
+      if (state.plan) {
+        parts.push(`SoundCloud: ${downloadSourceName(state.plan)}`)
+      } else if (state.url) {
+        parts.push(`SoundCloud: ${state.url}`)
+      }
+      if (state.outputDir) {
+        parts.push(`Folder: ${state.outputDir}`)
+      }
+      this.subtitle = parts.join("    ->    ")
+    }
+    let step = 0
+    const flow = () => ({
+      name: "Download",
+      step: step + 1,
+      total: stepLabels.length,
+      label: stepLabels[step],
+    })
+
+    try {
+      while (step < stepLabels.length && this.running) {
+        try {
+          const current = stepLabels[step]
+          if (current === "SoundCloud URL") {
+            const value = await this.input("Download SoundCloud", "Paste SoundCloud URL(s)", state.url, {
+              placeholder: "https://soundcloud.com/you/sets/test",
+              flow: flow(),
+            })
+            const urls = splitUrls(value)
+            if (!urls.length) {
+              return
+            }
+            if (value.trim() !== state.url) {
+              state.url = value.trim()
+              state.urls = urls
+              state.plan = undefined
+              state.outputDir = undefined
+              updateSubtitle()
+            }
+            step += 1
+          } else if (current === "Review download") {
+            if (!state.plan) {
+              state.plan = await this.status("Reading SoundCloud", ["Expanding SoundCloud URL(s)..."], async (write) => {
+                const raw = (await this.bridge.json("plan", state.urls)) as unknown as DownloadPlan & { ok: boolean }
+                write(`Title: ${downloadSourceName(raw)}`)
+                write(`Tracks: ${raw.count}`)
+                return raw
+              }, flow())
+              if (!state.plan.count) {
+                await this.message("No Tracks", ["No downloadable tracks were found."], "Back", flow())
+                return
+              }
+              state.outputDir = suggestedOutputFolder(this.config.output_dir, downloadSourceName(state.plan))
+              updateSubtitle()
+            }
+            const preview = state.plan.entries.slice(0, 8).map((entry, index) => `${index + 1}. ${entry.label}`)
+            if (state.plan.entries.length > preview.length) {
+              preview.push(`... ${state.plan.entries.length - preview.length} more`)
+            }
+            await this.message(
+              "Download Plan",
+              [
+                `Source: ${downloadSourceName(state.plan)}`,
+                `Tracks: ${state.plan.count}`,
+                "",
+                ...preview,
+              ],
+              "Continue",
+              flow(),
+            )
+            step += 1
+          } else if (current === "Folder") {
+            if (!state.plan) {
+              step = Math.max(0, step - 1)
+              continue
+            }
+            const def = state.outputDir ?? suggestedOutputFolder(this.config.output_dir, downloadSourceName(state.plan))
+            const folder = await this.input("Download Folder", "Folder name or full path", def, {
+              placeholder: "set-2",
+              flow: flow(),
+            })
+            state.outputDir = resolveDownloadPath(folder, def)
+            updateSubtitle()
+            step += 1
+          } else if (current === "Confirm") {
+            if (!state.plan || !state.outputDir) {
+              step = Math.max(0, step - 1)
+              continue
+            }
+            const confirmed = await this.confirm(
+              "Confirm Download",
+              [
+                `Download "${downloadSourceName(state.plan)}".`,
+                `Tracks: ${state.plan.count}`,
+                `Folder: ${state.outputDir}`,
+                "Reruns reuse this folder's archive so already downloaded tracks are skipped.",
+                "No analysis, tags, or Rekordbox changes.",
+              ],
+              true,
+              flow(),
+            )
+            if (!confirmed) {
+              return
+            }
+            step += 1
+          } else if (current === "Run") {
+            if (!state.plan || !state.outputDir) {
+              step = Math.max(0, step - 1)
+              continue
+            }
+            const settings = optimalDownloadSettings(this.config)
+            const final = await this.status("Downloading", [], async (write) => {
+              return await this.bridge.events(
+                "download",
+                [
+                  "--output-dir",
+                  state.outputDir!,
+                  "--workers",
+                  String(settings.workers),
+                  "--fragments",
+                  String(settings.fragments),
+                  "--quality",
+                  settings.quality,
+                  ...state.urls,
+                ],
+                undefined,
+                (event) => {
+                  if (event.message) {
+                    write(String(event.message))
+                  } else if (event.event === "plan") {
+                    write(`Found ${event.count} track(s).`)
+                  }
+                },
+              )
+            }, flow())
+            const failures = (final.failures || []) as Array<{
+              title?: string
+              url?: string
+              id?: string
+              error?: string
+            }>
+            const lines: string[] = [
+              `Source: ${final.title || downloadSourceName(state.plan)}`,
+              `Folder: ${final.output_dir || state.outputDir}`,
+              `Tracks available locally: ${Array.isArray(final.paths) ? final.paths.length : final.downloaded_count || 0}`,
+              failures.length ? `Failed: ${failures.length}` : "",
+            ].filter(Boolean) as string[]
+            if (failures.length) {
+              lines.push("")
+              lines.push(`${failures.length} track(s) could not be downloaded:`)
+              for (const failure of failures.slice(0, 8)) {
+                const label = failure.title || failure.url || failure.id || "(unknown)"
+                const reason = failure.error ? ` - ${truncateReason(failure.error)}` : ""
+                lines.push(`   - ${label}${reason}`)
+              }
+              if (failures.length > 8) {
+                lines.push(`   - ... ${failures.length - 8} more`)
+              }
+              if (final.failed_report) {
+                lines.push(`Report: ${final.failed_report}`)
+              }
+            }
+            await this.message("Download Complete", lines, "Done", flow(), false)
+            return
+          }
+        } catch (error) {
+          if (error instanceof Back) {
+            if (step === 0) {
+              return
+            }
+            step -= 1
+            continue
+          }
+          throw error
+        }
+      }
+    } finally {
+      this.subtitle = previousSubtitle
     }
   }
 
@@ -1172,6 +1373,16 @@ function suggestedOutputFolder(current: string, sourceName: string): string {
     return current
   }
   return join(HOME, "Downloads", sourceName.replace(/[^\w .-]+/g, "-").trim() || basename(current))
+}
+
+function downloadSourceName(plan: DownloadPlan): string {
+  if (plan.title) {
+    return plan.title
+  }
+  if (plan.entries.length === 1) {
+    return plan.entries[0]?.title || "SoundCloud Download"
+  }
+  return "SoundCloud Downloads"
 }
 
 function resolveDownloadPath(value: string, defaultPath: string): string {

@@ -75,14 +75,21 @@ Interactive menus support Up/Down, Enter to select, Escape/Left/`b` to go back, 
 
 Download and import workflows show a `Step X/Y` progress indicator in the header. Back navigation is local to the current workflow, so pressing Left halfway through prep returns to the previous step instead of dumping you at the home menu.
 
-Typical flow:
+Download-only flow:
 
-1. Choose `Download SoundCloud URL or playlist`.
+1. Choose `Download only`.
 2. Paste a SoundCloud track, playlist, or likes URL.
-3. Enter an output folder. `set-2` means `~/Downloads/set-2`.
-4. Let it download and analyze. Download quality and parallelism are chosen automatically.
-5. Write tags and generate Rekordbox import files when prompted.
-6. Push directly to Rekordbox if Rekordbox is closed.
+3. Review the track count and suggested folder.
+4. Enter a folder name or full path. `set-2` means `~/Downloads/set-2`.
+5. Download. No analysis, tags, or Rekordbox changes are made.
+
+Rekordbox sync flow:
+
+1. Choose `Sync a SoundCloud URL`.
+2. Paste a SoundCloud track, playlist, or likes URL.
+3. Review deltas and the auto-picked playlist name.
+4. Confirm analysis and Rekordbox import.
+5. Close Rekordbox when prompted so cues and playlist changes can be written.
 
 Examples of accepted URLs:
 
@@ -95,6 +102,7 @@ https://soundcloud.com/ariaattar/likes
 Advanced shortcuts also exist:
 
 ```bash
+soundcloud-dl https://soundcloud.com/deeperpurpose/jenny-extended -o jenny
 soundcloud-dl sync-likes
 soundcloud-dl doctor
 soundcloud-dl --dry-run https://soundcloud.com/deeperpurpose/jenny-extended
