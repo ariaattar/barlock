@@ -6,6 +6,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 from pyrekordbox import Rekordbox6Database, RekordboxXml
 from pyrekordbox.db6 import tables
@@ -361,9 +362,35 @@ def _ensure_content(db: Rekordbox6Database, item: TrackFeatures):
     existing = db.get_content(FolderPath=path).first()
     if existing is not None:
         return existing, False
-    content = db.add_content(
-        path,
-        Title=item.title or Path(path).stem,
+    content = _add_content_with_string_id(db, Path(path), item)
+    return content, True
+
+
+def _add_content_with_string_id(db: Rekordbox6Database, path: Path, item: TrackFeatures):
+    path = path.resolve()
+    content_id = _new_rekordbox_id(db, tables.DjmdContent)
+    file_id = _new_rekordbox_id(db, tables.DjmdContent, id_field_name="rb_file_id")
+    content_link = db.get_menu_items(Name="TRACK").one()
+    device = db.get_device().first()
+    date_created = dt.date.today()
+    file_type = _file_type_for_path(path)
+
+    content = tables.DjmdContent.create(
+        ID=content_id,
+        UUID=str(uuid4()),
+        ContentLink=content_link.rb_local_usn,
+        DateCreated=date_created,
+        DeviceID=device.ID,
+        FileNameL=path.name,
+        FileSize=path.stat().st_size,
+        FileType=file_type.value,
+        FolderPath=str(path),
+        HotCueAutoLoad="on",
+        MasterDBID=device.MasterDBID,
+        MasterSongID=content_id,
+        StockDate=date_created,
+        rb_file_id=file_id,
+        Title=item.title or path.stem,
         BPM=int(round(item.bpm * 100)) if item.bpm > 0 else None,
         Length=int(round(item.duration_sec)) if item.duration_sec else None,
         BitRate=320,
@@ -371,7 +398,17 @@ def _ensure_content(db: Rekordbox6Database, item: TrackFeatures):
         Commnt=_comment(item),
         Analysed=0,
     )
-    return content, True
+    db.add(content)
+    db.flush()
+    return content
+
+
+def _file_type_for_path(path: Path):
+    file_type_string = path.suffix.lstrip(".").upper()
+    try:
+        return getattr(tables.FileType, file_type_string)
+    except AttributeError as exc:
+        raise ValueError(f"Invalid file type: {path.suffix}") from exc
 
 
 def _apply_metadata(db: Rekordbox6Database, content, item: TrackFeatures) -> None:
@@ -532,7 +569,14 @@ def _get_or_add_artist(db: Rekordbox6Database, name: str):
     artist = db.get_artist(Name=name).first()
     if artist is not None:
         return artist
-    return db.add_artist(name)
+    artist = tables.DjmdArtist.create(ID=_new_rekordbox_id(db, tables.DjmdArtist), Name=name, UUID=str(uuid4()))
+    db.add(artist)
+    db.flush()
+    return artist
+
+
+def _new_rekordbox_id(db: Rekordbox6Database, table, *, id_field_name: str = "ID") -> str:
+    return str(db.generate_unused_id(table, id_field_name=id_field_name))
 
 
 def _comment(item: TrackFeatures) -> str:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -136,6 +137,21 @@ def test_bridge_push_uses_payload_features(monkeypatch, tmp_path):
         "playlist_id": None,
     }
     assert emitted[-1][0] == "done"
+
+
+def test_bridge_main_emits_clean_json_for_unexpected_errors(monkeypatch, capsys):
+    def fail(_args):
+        raise Exception("db exploded")
+
+    monkeypatch.setattr(bridge, "_cmd_config", fail)
+
+    assert bridge.main(["config"]) == 1
+
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+    assert payload["event"] == "error"
+    assert payload["message"] == "Exception: db exploded"
+    assert "Traceback" not in output.err
 
 
 def test_parallel_analyze_preserves_order_and_uses_pool(monkeypatch, tmp_path):

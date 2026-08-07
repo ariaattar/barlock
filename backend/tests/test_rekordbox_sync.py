@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from xml.etree import ElementTree
 
 from app.audio_features import CueHint, TrackFeatures
-from app.rekordbox_sync import _beat_loop_size, _cue_kind, _sync_cue_hints, write_rekordbox_xml
+from app.rekordbox_sync import (
+    _beat_loop_size,
+    _cue_kind,
+    _ensure_content,
+    _get_or_add_artist,
+    _sync_cue_hints,
+    write_rekordbox_xml,
+)
 
 
 class FakeQuery:
@@ -14,6 +22,14 @@ class FakeQuery:
     def all(self):
         return self.rows
 
+    def first(self):
+        return self.rows[0] if self.rows else None
+
+    def one(self):
+        if len(self.rows) != 1:
+            raise AssertionError(f"expected one row, got {len(self.rows)}")
+        return self.rows[0]
+
 
 class FakeDb:
     def __init__(self, existing=None):
@@ -21,13 +37,26 @@ class FakeDb:
         self.added = []
         self.deleted = []
         self.next_id = 1000
+        self.flushed = 0
 
     def get_cue(self, **kwargs):
         assert kwargs["ContentID"] == "track-1"
         return FakeQuery(self.existing)
 
-    def generate_unused_id(self, table, is_28_bit=True):
-        assert not is_28_bit
+    def get_content(self, **kwargs):
+        return FakeQuery([])
+
+    def get_menu_items(self, **kwargs):
+        assert kwargs["Name"] == "TRACK"
+        return FakeQuery([SimpleNamespace(rb_local_usn=10)])
+
+    def get_device(self):
+        return FakeQuery([SimpleNamespace(ID="device-1", MasterDBID="master-1")])
+
+    def get_artist(self, **kwargs):
+        return FakeQuery([])
+
+    def generate_unused_id(self, table, is_28_bit=True, id_field_name="ID"):
         self.next_id += 1
         return self.next_id
 
@@ -36,6 +65,9 @@ class FakeDb:
 
     def delete(self, instance):
         self.deleted.append(instance)
+
+    def flush(self):
+        self.flushed += 1
 
 
 def test_cue_kind_maps_hotcue_slots_to_rekordbox_kinds():
@@ -46,6 +78,33 @@ def test_cue_kind_maps_hotcue_slots_to_rekordbox_kinds():
     assert _cue_kind(CueHint("Memory", 1.0, "memory", None)) == 0
     assert _cue_kind(CueHint("Bad", 1.0, "hot", 8)) is None
     assert _cue_kind(CueHint("Intro Loop", 1.0, "loop", 3, 5.0, 8)) == 5
+
+
+def test_ensure_content_creates_rekordbox_content_with_string_ids(tmp_path):
+    path = tmp_path / "track.mp3"
+    path.write_bytes(b"mp3")
+    db = FakeDb()
+    features = replace(_features([]), path=str(path))
+
+    content, created = _ensure_content(db, features)
+
+    assert created is True
+    assert isinstance(content.ID, str)
+    assert isinstance(content.MasterSongID, str)
+    assert isinstance(content.rb_file_id, str)
+    assert content.ID == content.MasterSongID
+    assert content.FolderPath == str(path.resolve())
+    assert db.flushed == 1
+
+
+def test_get_or_add_artist_creates_artist_with_string_id():
+    db = FakeDb()
+
+    artist = _get_or_add_artist(db, "Artist")
+
+    assert isinstance(artist.ID, str)
+    assert artist.Name == "Artist"
+    assert db.flushed == 1
 
 
 def test_beat_loop_size_uses_rekordbox_encoding():

@@ -53,6 +53,9 @@ def main(argv: list[str] | None = None) -> int:
     except (SoundCloudDownloadError, ValueError, RuntimeError, OSError) as exc:
         _emit("error", message=str(exc))
         return 1
+    except Exception as exc:
+        _emit("error", message=f"{type(exc).__name__}: {exc}")
+        return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
