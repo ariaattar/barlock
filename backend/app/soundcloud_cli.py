@@ -50,8 +50,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if raw_args[:1] == ["sync-likes"]:
             args = _build_sync_parser().parse_args(raw_args[1:])
+            likes_config = AppConfig(soundcloud_username=args.username or config.soundcloud_username)
+            if not likes_config.likes_url:
+                print(
+                    "error: enter a SoundCloud username: soundcloud-dl sync-likes <username>",
+                    file=sys.stderr,
+                )
+                return 2
             return _download_urls(
-                [config.likes_url],
+                [likes_config.likes_url],
                 output_dir=config.output_path,
                 workers=config.workers,
                 fragments=config.fragments,
@@ -84,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _build_sync_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="soundcloud-dl sync-likes")
+    parser.add_argument("username", nargs="?", help="SoundCloud username")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--no-analyze", action="store_true")

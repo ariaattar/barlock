@@ -12,7 +12,7 @@ DEFAULT_OUTPUT_DIR = Path.home() / "Downloads" / "SoundCloud.app_Set"
 
 @dataclass
 class AppConfig:
-    soundcloud_username: str = "ariaattar"
+    soundcloud_username: str = ""
     output_dir: str = str(DEFAULT_OUTPUT_DIR)
     workers: int = 8
     fragments: int = 8
@@ -36,7 +36,9 @@ class AppConfig:
 
     @property
     def likes_url(self) -> str:
-        username = self.soundcloud_username.strip().strip("/")
+        username = self.soundcloud_username.strip().strip("/").removeprefix("@")
+        if not username:
+            return ""
         return f"https://soundcloud.com/{username}/likes"
 
 

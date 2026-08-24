@@ -255,8 +255,10 @@ class TuiApp {
             value: "sync",
           },
           {
-            label: `Sync likes for @${this.config.soundcloud_username}`,
-            description: this.config.likes_url,
+            label: this.config.soundcloud_username
+              ? `Sync likes for @${this.config.soundcloud_username}`
+              : "Sync SoundCloud likes",
+            description: this.config.likes_url || "Enter a SoundCloud username",
             value: "likes",
           },
           {
@@ -284,7 +286,7 @@ class TuiApp {
         } else if (choice === "sync") {
           await this.syncFlow()
         } else if (choice === "likes") {
-          await this.syncFlow(this.config.likes_url)
+          await this.syncLikesFlow()
         } else if (choice === "reanalyze") {
           await this.reanalyzeFlow()
         } else if (choice === "doctor") {
@@ -677,6 +679,10 @@ class TuiApp {
             )
           }, flow())
           const push = (final.push || {}) as Record<string, unknown>
+          const pendingGridAlignment = Number(push.pending_grid_alignment || 0)
+          const gridRepair = pendingGridAlignment > 0
+            ? await this.finalizeGridAfterImport(pendingGridAlignment)
+            : null
           const failedDownloads = (final.failed_downloads || []) as Array<{
             id: string
             title: string
@@ -694,6 +700,11 @@ class TuiApp {
               ? `Added to playlist: ${push.added_to_playlist}   Removed: ${push.removed_from_playlist}   Cues: ${push.added_cues}   Loops: ${push.added_loops}`
               : "",
             push.backup_dir ? `Backup: ${push.backup_dir}` : "",
+            gridRepair
+              ? `Grid-aligned loops: ${gridRepair.repaired || 0}`
+              : pendingGridAlignment
+                ? `${pendingGridAlignment} track(s) still need grid alignment in Rekordbox Doctor.`
+                : "",
           ]
           if (failedDownloads.length) {
             lines.push("")
@@ -963,6 +974,101 @@ class TuiApp {
     }
   }
 
+  private async finalizeGridAfterImport(
+    pendingTracks: number,
+  ): Promise<Record<string, unknown> | null> {
+    try {
+      const action = await this.select("Finish Loop Alignment", [
+        {
+          label: "Open Rekordbox and finish now",
+          description: `${pendingTracks} new track(s) need Rekordbox's beat grid`,
+          value: "finish" as const,
+        },
+        {
+          label: "Finish later in Rekordbox Doctor",
+          description: "Loops remain provisional until then",
+          value: "later" as const,
+        },
+      ])
+      if (action !== "finish") {
+        return null
+      }
+
+      const opened = await this.status(
+        "Opening Rekordbox",
+        ["Starting Rekordbox so it can analyze the imported tracks..."],
+        async () => await this.bridge.json("open-rekordbox"),
+      )
+      if (!opened.opened) {
+        await this.message(
+          "Could Not Open Rekordbox",
+          ["Open Rekordbox manually, let it analyze the tracks, then use Rekordbox Doctor."],
+          "Back",
+        )
+        return null
+      }
+
+      await this.message(
+        "Analyze Imported Tracks",
+        [
+          `Wait for Rekordbox to finish analyzing ${pendingTracks} imported track(s).`,
+          "If analysis does not start automatically, select the imported playlist, select all tracks, and choose Analyze Track.",
+          "Return here only after Rekordbox's analysis jobs are finished.",
+        ],
+        "Analysis Finished",
+      )
+
+      const close = await this.select("Finalize Loop Grid", [
+        {
+          label: "Close Rekordbox and align loops",
+          description: "Creates a backup before updating generated loops",
+          value: "close" as const,
+        },
+        {
+          label: "Finish later in Rekordbox Doctor",
+          value: "later" as const,
+        },
+      ])
+      if (close !== "close") {
+        return null
+      }
+
+      await this.status("Closing Rekordbox", ["Waiting for Rekordbox to close safely..."], async () => {
+        return await this.bridge.json("close-rekordbox")
+      })
+      const running = await this.bridge.json("rekordbox-running")
+      if (running.running) {
+        await this.message(
+          "Rekordbox Still Open",
+          ["Close Rekordbox, then run Rekordbox Doctor to align the loops."],
+          "Back",
+        )
+        return null
+      }
+
+      const repaired = await this.status("Aligning Imported Loops", [], async () => {
+        return await this.bridge.json("repair-generated-off-grid-loops")
+      })
+      if (!Number(repaired.repaired || 0)) {
+        await this.message(
+          "No Loops Aligned",
+          [
+            "Rekordbox did not create a beat grid for the imported tracks yet.",
+            "Finish analysis in Rekordbox, then run Rekordbox Doctor.",
+          ],
+          "Back",
+        )
+        return null
+      }
+      return repaired
+    } catch (error) {
+      if (error instanceof Back) {
+        return null
+      }
+      throw error
+    }
+  }
+
   private async pickTracks(
     tracks: Array<{ content_id: string; title: string; artist: string; file_exists: boolean }>,
     flow?: FlowProgress,
@@ -1011,16 +1117,117 @@ class TuiApp {
     }
   }
 
-private async doctorFlow(): Promise<void> {
+  private async doctorFlow(): Promise<void> {
     const raw = await this.bridge.json("doctor", ["--output-dir", this.config.output_dir])
     const data = raw.doctor as Record<string, unknown>
-    await this.message("Rekordbox Doctor", [
+    const activeLoops = (data.generated_active_loops || []) as Array<{
+      title?: string
+      artist?: string
+      cue_name?: string
+      in_msec?: number
+    }>
+    const offGridLoops = (data.generated_off_grid_loops || []) as Array<{
+      title?: string
+      artist?: string
+      cue_name?: string
+      old_in_msec?: number
+      new_in_msec?: number
+      loop_beats?: number
+    }>
+    const lines = [
       `Rekordbox running: ${data.rekordbox_running ? "yes" : "no"}`,
       `Collection tracks: ${data.collection_tracks}`,
       `Local tracks: ${data.local_tracks}`,
       `Missing files: ${(data.missing_files as unknown[]).length}`,
       `Downloaded not imported: ${(data.unimported_output_files as unknown[]).length}`,
-    ], "Back")
+      `Generated active loops: ${activeLoops.length}`,
+      `Generated off-grid loops: ${offGridLoops.length}`,
+    ]
+    if (!activeLoops.length && !offGridLoops.length) {
+      await this.message("Rekordbox Doctor", lines, "Back")
+      return
+    }
+
+    if (activeLoops.length) {
+      lines.push("")
+      lines.push("Active loops can make an XDJ load a track at the loop position.")
+      for (const issue of activeLoops.slice(0, 4)) {
+        const artist = issue.artist ? `${issue.artist} - ` : ""
+        lines.push(`- ${artist}${issue.title || "Untitled"}: ${issue.cue_name || "Loop"}`)
+      }
+      if (activeLoops.length > 4) {
+        lines.push(`- ... ${activeLoops.length - 4} more active loops`)
+      }
+    }
+    if (offGridLoops.length) {
+      lines.push("")
+      lines.push("Off-grid generated loops can be aligned without reanalyzing audio.")
+      for (const issue of offGridLoops.slice(0, 4)) {
+        const artist = issue.artist ? `${issue.artist} - ` : ""
+        lines.push(`- ${artist}${issue.title || "Untitled"}: ${issue.cue_name || "Loop"}`)
+      }
+      if (offGridLoops.length > 4) {
+        lines.push(`- ... ${offGridLoops.length - 4} more off-grid loops`)
+      }
+    }
+
+    const actions: SelectItem<"active" | "grid" | "back">[] = []
+    if (offGridLoops.length) {
+      actions.push({
+        label: `Align ${offGridLoops.length} generated loop(s) to the Rekordbox grid`,
+        description: "Fast repair; backs up Rekordbox and preserves manual loops",
+        value: "grid",
+      })
+    }
+    if (activeLoops.length) {
+      actions.push({
+        label: `Disable ${activeLoops.length} generated active loop(s)`,
+        description: "Backs up Rekordbox, preserves manual loops",
+        value: "active",
+      })
+    }
+    actions.push({ label: "Back", value: "back" })
+    const action = await this.select("Rekordbox Doctor", actions, { intro: lines.join("\n") })
+    if (action === "back") {
+      return
+    }
+
+    if (data.rekordbox_running) {
+      const close = await this.select("Rekordbox Is Open", [
+        { label: "Close Rekordbox and continue", description: "Required for direct DB writes", value: "close" },
+        { label: "Cancel", value: "cancel" },
+      ])
+      if (close !== "close") {
+        return
+      }
+      await this.status("Closing Rekordbox", ["Asking Rekordbox to quit..."], async () => {
+        return await this.bridge.json("close-rekordbox")
+      })
+    }
+    const running = await this.bridge.json("rekordbox-running")
+    if (running.running) {
+      await this.message("Rekordbox Still Open", ["Close Rekordbox, then run Doctor again."], "Back")
+      return
+    }
+    const aligningGrid = action === "grid"
+    const repaired = await this.status(
+      aligningGrid ? "Aligning Generated Loops" : "Repairing Active Loops",
+      [],
+      async () => {
+        return await this.bridge.json(
+          aligningGrid ? "repair-generated-off-grid-loops" : "repair-generated-active-loops",
+        )
+      },
+    )
+    await this.message(
+      aligningGrid ? "Generated Loops Aligned" : "Active Loops Disabled",
+      [
+        `${aligningGrid ? "Aligned" : "Disabled"}: ${repaired.repaired || 0}`,
+        repaired.backup_dir ? `Backup: ${repaired.backup_dir}` : "",
+        "Re-export the affected playlist to the USB in Rekordbox before testing on the XDJ.",
+      ].filter(Boolean) as string[],
+      "Done",
+    )
   }
 
   private async settingsFlow(): Promise<void> {
@@ -1049,6 +1256,26 @@ private async doctorFlow(): Promise<void> {
     })
     this.config = raw.config as Config
     await this.message("Settings Saved", [this.config.config_path], "Back")
+  }
+
+  private async syncLikesFlow(): Promise<void> {
+    const enteredUsername = await this.input(
+      "Sync SoundCloud Likes",
+      "SoundCloud username",
+      this.config.soundcloud_username,
+      { placeholder: "username" },
+    )
+    const username = enteredUsername.trim().replace(/^@/, "").replace(/^\/+|\/+$/g, "")
+    if (!username) {
+      await this.message("Username Required", ["Enter a SoundCloud username to sync likes."], "Back")
+      return
+    }
+
+    if (username !== this.config.soundcloud_username) {
+      const raw = await this.bridge.json("save-config", [], { soundcloud_username: username })
+      this.config = raw.config as Config
+    }
+    await this.syncFlow(`https://soundcloud.com/${username}/likes`)
   }
 
   private async confirm(title: string, lines: string[], defaultValue: boolean, flow?: FlowProgress): Promise<boolean> {
@@ -1263,7 +1490,9 @@ private async doctorFlow(): Promise<void> {
       height: 1,
     }))
     header.add(new TextRenderable(this.renderer, {
-      content: this.subtitle || `@${this.config.soundcloud_username} likes: ${this.config.likes_url}`,
+      content: this.subtitle || (this.config.likes_url
+        ? `@${this.config.soundcloud_username} likes: ${this.config.likes_url}`
+        : "SoundCloud likes username not set"),
       fg: theme.dim,
       width: "100%",
       height: 1,

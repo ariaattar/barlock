@@ -50,6 +50,29 @@ def test_sync_likes_subcommand_uses_configured_likes(monkeypatch, tmp_path):
     assert seen["urls"] == ["https://soundcloud.com/me/likes"]
 
 
+def test_sync_likes_subcommand_accepts_username(monkeypatch, tmp_path):
+    cfg = AppConfig(output_dir=str(tmp_path), archive_path=str(tmp_path / ".archive"))
+    seen: dict[str, object] = {}
+
+    def fake_collect(urls, verbose=False):
+        seen["urls"] = urls
+        return DownloadPlan([DownloadEntry(url="https://soundcloud.com/u/t", id="1", title="Track")])
+
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli, "collect_download_plan", fake_collect)
+
+    assert cli.main(["sync-likes", "another-dj", "--dry-run"]) == 0
+    assert seen["urls"] == ["https://soundcloud.com/another-dj/likes"]
+
+
+def test_sync_likes_requires_username_when_not_configured(monkeypatch, capsys, tmp_path):
+    cfg = AppConfig(output_dir=str(tmp_path), archive_path=str(tmp_path / ".archive"))
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+
+    assert cli.main(["sync-likes", "--dry-run"]) == 2
+    assert "enter a SoundCloud username" in capsys.readouterr().err
+
+
 def test_analyze_subcommand_accepts_empty_folder(monkeypatch, tmp_path, capsys):
     cfg = AppConfig(output_dir=str(tmp_path), archive_path=str(tmp_path / ".archive"))
     monkeypatch.setattr(cli, "load_config", lambda: cfg)

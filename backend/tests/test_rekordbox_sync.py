@@ -10,7 +10,10 @@ from app.rekordbox_sync import (
     _cue_kind,
     _ensure_content,
     _get_or_add_artist,
+    _snap_loop_hints_to_rekordbox_grid,
     _sync_cue_hints,
+    repair_generated_active_loops,
+    repair_generated_off_grid_loops,
     write_rekordbox_xml,
 )
 
@@ -70,6 +73,41 @@ class FakeDb:
         self.flushed += 1
 
 
+class ActiveLoopQuery:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def join(self, *_args):
+        return self
+
+    def filter(self, *_args):
+        return self
+
+    def all(self):
+        return self.rows
+
+
+class ActiveLoopDb:
+    def __init__(self, rows):
+        self.rows = rows
+        self.committed = False
+        self.closed = False
+        self.rolled_back = False
+        self.session = SimpleNamespace(rollback=self._rollback)
+
+    def query(self, *_args):
+        return ActiveLoopQuery(self.rows)
+
+    def commit(self):
+        self.committed = True
+
+    def close(self):
+        self.closed = True
+
+    def _rollback(self):
+        self.rolled_back = True
+
+
 def test_cue_kind_maps_hotcue_slots_to_rekordbox_kinds():
     assert _cue_kind(CueHint("A", 1.0, "hot", 0)) == 1
     assert _cue_kind(CueHint("C", 1.0, "hot", 2)) == 3
@@ -105,6 +143,141 @@ def test_get_or_add_artist_creates_artist_with_string_id():
     assert isinstance(artist.ID, str)
     assert artist.Name == "Artist"
     assert db.flushed == 1
+
+
+def test_loop_hints_snap_to_rekordbox_grid_with_exact_beat_length():
+    features = _features(
+        [
+            CueHint("Intro", 0.07, "hot", 0),
+            CueHint("Exit Loop", 10.19, "loop", 4, 13.96, 8),
+            CueHint("Outro", 40.0, "memory", None),
+        ]
+    )
+    grid = [70, 539, 1008, 1477, 1945, 2414, 2883, 3352, 3820, 4289, 4758, 5227, 5695, 6164, 6633, 7102, 7570, 8039, 8508, 8977, 9445, 9914, 10383, 10852, 11320, 11789, 12258, 12727, 13195, 13664, 14133]
+
+    snapped = _snap_loop_hints_to_rekordbox_grid(features, grid)
+    by_name = {cue.name: cue for cue in snapped.cue_hints}
+
+    assert by_name["Intro"].seconds == 0.07
+    assert by_name["Outro"].seconds == 40.0
+    assert by_name["Exit Loop"].seconds == 10.383
+    assert by_name["Exit Loop"].end_seconds == 14.133
+
+
+def test_loop_hints_keep_audio_grid_when_rekordbox_grid_is_unavailable():
+    features = _features([CueHint("Exit Loop", 10.19, "loop", 4, 13.96, 8)])
+
+    assert _snap_loop_hints_to_rekordbox_grid(features, []).cue_hints == features.cue_hints
+
+
+def test_repair_generated_active_loops_only_disables_soundcloud_dl_auto_loops(monkeypatch, tmp_path):
+    from app import rekordbox_sync
+
+    generated_cue = SimpleNamespace(
+        ID="cue-1",
+        Kind=5,
+        InMsec=180000,
+        OutMsec=184000,
+        ActiveLoop=1,
+        Comment="Exit Loop",
+    )
+    generated_content = SimpleNamespace(
+        ID="track-1",
+        Title="Generated Track",
+        FolderPath="/tmp/generated.mp3",
+        Commnt="soundcloud-dl | https://soundcloud.com/a/b",
+        Artist=SimpleNamespace(Name="Artist"),
+    )
+    manual_cue = SimpleNamespace(
+        ID="cue-2",
+        Kind=5,
+        InMsec=120000,
+        OutMsec=124000,
+        ActiveLoop=1,
+        Comment="Manual Loop",
+    )
+    manual_content = SimpleNamespace(
+        ID="track-2",
+        Title="Manual Track",
+        FolderPath="/tmp/manual.mp3",
+        Commnt="",
+        Artist=None,
+    )
+    db = ActiveLoopDb([(generated_cue, generated_content), (manual_cue, manual_content)])
+    backup = tmp_path / "backup"
+
+    monkeypatch.setattr(rekordbox_sync, "Rekordbox6Database", lambda: db)
+    monkeypatch.setattr(rekordbox_sync, "rekordbox_running", lambda: False)
+    monkeypatch.setattr(rekordbox_sync, "backup_rekordbox", lambda: backup)
+
+    result = repair_generated_active_loops()
+
+    assert generated_cue.ActiveLoop == 0
+    assert manual_cue.ActiveLoop == 1
+    assert [issue.title for issue in result.repaired] == ["Generated Track"]
+    assert result.backup_dir == backup
+    assert db.committed is True
+    assert db.closed is True
+
+
+def test_repair_generated_off_grid_loops_snaps_only_managed_four_or_eight_beat_loops(monkeypatch, tmp_path):
+    from app import rekordbox_sync
+
+    generated_cue = SimpleNamespace(
+        ID="cue-1",
+        Kind=6,
+        InMsec=10190,
+        OutMsec=13960,
+        BeatLoopSize=(8 << 16) | 1,
+        ActiveLoop=0,
+        Comment="Exit Loop",
+    )
+    generated_content = SimpleNamespace(
+        ID="track-1",
+        Title="Generated Track",
+        FolderPath="/tmp/generated.mp3",
+        Commnt="soundcloud-dl | https://soundcloud.com/a/b",
+        CueUpdated="4",
+        Artist=SimpleNamespace(Name="Artist"),
+    )
+    manual_cue = SimpleNamespace(
+        ID="cue-2",
+        Kind=6,
+        InMsec=10190,
+        OutMsec=13960,
+        BeatLoopSize=(8 << 16) | 1,
+        ActiveLoop=0,
+        Comment="Exit Loop",
+    )
+    manual_content = SimpleNamespace(
+        ID="track-2",
+        Title="Manual Track",
+        FolderPath="/tmp/manual.mp3",
+        Commnt="",
+        CueUpdated="2",
+        Artist=None,
+    )
+    db = ActiveLoopDb([(generated_cue, generated_content), (manual_cue, manual_content)])
+    backup = tmp_path / "backup"
+    grid = [70 + index * 469 for index in range(40)]
+
+    monkeypatch.setattr(rekordbox_sync, "Rekordbox6Database", lambda: db)
+    monkeypatch.setattr(rekordbox_sync, "rekordbox_running", lambda: False)
+    monkeypatch.setattr(rekordbox_sync, "backup_rekordbox", lambda: backup)
+    monkeypatch.setattr(rekordbox_sync, "_rekordbox_grid_times_ms", lambda _content: grid)
+
+    result = repair_generated_off_grid_loops()
+
+    assert generated_cue.InMsec == 10388
+    assert generated_cue.OutMsec == 14140
+    assert generated_cue.ActiveLoop == 0
+    assert generated_content.CueUpdated == "5"
+    assert manual_cue.InMsec == 10190
+    assert manual_content.CueUpdated == "2"
+    assert [issue.title for issue in result.repaired] == ["Generated Track"]
+    assert result.backup_dir == backup
+    assert db.committed is True
+    assert db.closed is True
 
 
 def test_beat_loop_size_uses_rekordbox_encoding():
@@ -211,6 +384,7 @@ def test_sync_cue_hints_replaces_old_soundcloud_dl_auto_cues():
         SimpleNamespace(Kind=2, InMsec=30000, Comment="Phrase 16"),
         SimpleNamespace(Kind=3, InMsec=60000, Comment="Phrase 32"),
         SimpleNamespace(Kind=4, InMsec=180000, Comment="Exit Loop"),
+        SimpleNamespace(Kind=0, InMsec=200000, Comment="Outro"),
         SimpleNamespace(Kind=7, InMsec=90000, Comment="Manual"),
     ]
     db = FakeDb(existing)
@@ -218,7 +392,7 @@ def test_sync_cue_hints_replaces_old_soundcloud_dl_auto_cues():
         ID="track-1",
         UUID="uuid-1",
         HotCueAutoLoad=None,
-        CueUpdated="5",
+        CueUpdated="6",
         Commnt="soundcloud-dl | https://soundcloud.com/test",
     )
     features = _features(
@@ -237,9 +411,9 @@ def test_sync_cue_hints_replaces_old_soundcloud_dl_auto_cues():
     assert skipped == 0
     assert added_loops == 2
     assert skipped_loops == 0
-    assert [cue.Comment for cue in db.deleted] == ["Intro", "Phrase 16", "Phrase 32", "Exit Loop"]
+    assert [cue.Comment for cue in db.deleted] == ["Intro", "Phrase 16", "Phrase 32", "Exit Loop", "Outro"]
     assert [cue.Kind for cue in db.added] == [1, 2, 3, 5, 6]
-    assert content.CueUpdated == "10"
+    assert content.CueUpdated == "11"
 
 
 def test_rekordbox_xml_writes_loop_marks(tmp_path):

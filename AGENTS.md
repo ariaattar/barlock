@@ -31,7 +31,7 @@ go build -o bin/soundcloud-dl ./cmd/soundcloud-dl
 To refresh the global local binary on this machine:
 
 ```bash
-ln -sfn /Users/ariaattar/Documents/Documents/Code/mixer/backend/bin/soundcloud-dl /opt/homebrew/bin/soundcloud-dl
+ln -sfn "$(pwd)/bin/soundcloud-dl" /opt/homebrew/bin/soundcloud-dl
 ```
 
 ## Safety Rules
@@ -53,7 +53,8 @@ The expected cue layout is:
 - C: `Phrase 32`
 - D: `Intro Loop`
 - E: `Exit Loop`
-- Memory: `Outro`
+
+Do not generate memory cues. On some XDJ configurations, a late-track memory cue becomes the load position. Use E (`Exit Loop`) as the generated exit marker instead.
 
 D and E loops should be conservative. Prefer clean 4 or 8 beat loops that start and end on beat-grid lines, favoring the first clean beat after pickup or transition hits. Skip loops that look unstable, faded, off-grid, or transition-heavy.
 

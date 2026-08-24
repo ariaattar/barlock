@@ -14,7 +14,7 @@ import numpy as np
 import soundfile as sf
 
 AUDIO_EXTS = {".mp3", ".wav", ".aiff", ".aif", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
-ANALYSIS_VERSION = 12
+ANALYSIS_VERSION = 13
 ENERGY_CURVE_BINS = 256
 
 NOTE_NAMES = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
@@ -1412,7 +1412,6 @@ def _cue_hints(
     drop_section = by_label.get("drop")
     breakdown_section = by_label.get("breakdown")
     last_drop_section = by_label.get("last_drop")
-    outro_section = by_label.get("outro")
 
     # The curve spans [0, curve_duration]. Pass curve_duration so the index→time
     # mapping inside the heuristic doesn't stretch curve points across an
@@ -1484,22 +1483,6 @@ def _cue_hints(
         else None
     )
 
-    # Outro: prefer section start when we both have an outro section AND it
-    # falls within the analyzed window. If the labeled outro is in the
-    # un-analyzed tail of a long track, or has very low boundary confidence,
-    # fall back to the simple bar*32-from-end heuristic — empty pad is better
-    # than a confidently-wrong outro location.
-    outro_in_window = (
-        outro_section is not None
-        and outro_section.start_sec <= curve_duration - bar * 2.0
-        and outro_section.confidence >= 0.30
-    )
-    outro_sec = (
-        outro_section.start_sec
-        if outro_in_window and outro_section is not None
-        else max(0.0, duration - bar * 32)
-    )
-
     intro_loop = (
         _best_intro_loop_candidate(
             duration=duration,
@@ -1539,7 +1522,6 @@ def _cue_hints(
         ),
         pad_f,
         pad_g,
-        CueHint("Outro", outro_sec, "memory", None),
     ]
 
     seen: set[tuple[str, int | None, int]] = set()

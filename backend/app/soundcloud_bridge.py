@@ -16,7 +16,10 @@ from .rekordbox_sync import (
     doctor,
     list_playlist_tracks,
     list_playlists,
+    open_rekordbox,
     push_tracks_to_playlist,
+    repair_generated_active_loops,
+    repair_generated_off_grid_loops,
     rekordbox_running,
     write_m3u,
     write_rekordbox_xml,
@@ -100,6 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("rekordbox-running").set_defaults(handler=_cmd_rekordbox_running)
     subparsers.add_parser("close-rekordbox").set_defaults(handler=_cmd_close_rekordbox)
+    subparsers.add_parser("open-rekordbox").set_defaults(handler=_cmd_open_rekordbox)
     subparsers.add_parser("list-playlists").set_defaults(handler=_cmd_list_playlists)
 
     push_parser = subparsers.add_parser("push")
@@ -109,6 +113,11 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser = subparsers.add_parser("doctor")
     doctor_parser.add_argument("--output-dir")
     doctor_parser.set_defaults(handler=_cmd_doctor)
+
+    subparsers.add_parser("repair-generated-active-loops").set_defaults(handler=_cmd_repair_generated_active_loops)
+    subparsers.add_parser("repair-generated-off-grid-loops").set_defaults(
+        handler=_cmd_repair_generated_off_grid_loops
+    )
 
     calibrate_parser = subparsers.add_parser("calibrate")
     calibrate_parser.add_argument("--manifest", required=True)
@@ -377,6 +386,11 @@ def _cmd_close_rekordbox(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_open_rekordbox(_args: argparse.Namespace) -> int:
+    _print_json({"ok": True, "opened": open_rekordbox()})
+    return 0
+
+
 def _cmd_list_playlists(_args: argparse.Namespace) -> int:
     playlists = list_playlists()
     _print_json(
@@ -424,6 +438,7 @@ def _cmd_push(args: argparse.Namespace) -> int:
         added_loops=result.added_loops,
         skipped_loops=result.skipped_loops,
         backup_dir=str(result.backup_dir),
+        pending_grid_alignment=getattr(result, "pending_grid_alignment", 0),
     )
     return 0
 
@@ -432,6 +447,50 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     config = load_config()
     output_dir = Path(args.output_dir).expanduser() if args.output_dir else config.output_path
     _print_json({"ok": True, "doctor": doctor(output_dir)})
+    return 0
+
+
+def _cmd_repair_generated_active_loops(_args: argparse.Namespace) -> int:
+    result = repair_generated_active_loops()
+    _print_json(
+        {
+            "ok": True,
+            "repaired": len(result.repaired),
+            "tracks": [
+                {
+                    "title": issue.title,
+                    "artist": issue.artist,
+                    "cue_name": issue.cue_name,
+                    "in_msec": issue.in_msec,
+                }
+                for issue in result.repaired
+            ],
+            "backup_dir": str(result.backup_dir) if result.backup_dir else "",
+        }
+    )
+    return 0
+
+
+def _cmd_repair_generated_off_grid_loops(_args: argparse.Namespace) -> int:
+    result = repair_generated_off_grid_loops()
+    _print_json(
+        {
+            "ok": True,
+            "repaired": len(result.repaired),
+            "tracks": [
+                {
+                    "title": issue.title,
+                    "artist": issue.artist,
+                    "cue_name": issue.cue_name,
+                    "old_in_msec": issue.old_in_msec,
+                    "new_in_msec": issue.new_in_msec,
+                    "loop_beats": issue.loop_beats,
+                }
+                for issue in result.repaired
+            ],
+            "backup_dir": str(result.backup_dir) if result.backup_dir else "",
+        }
+    )
     return 0
 
 
@@ -645,6 +704,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
             "added_cues": result.added_cues,
             "added_loops": result.added_loops,
             "backup_dir": str(result.backup_dir),
+            "pending_grid_alignment": getattr(result, "pending_grid_alignment", 0),
         }
         # Persist state with the new playlist binding
         state.rekordbox_playlist = result.playlist_name
@@ -768,6 +828,7 @@ def _cmd_reanalyze_playlist(args: argparse.Namespace) -> int:
         already_in_playlist=result.already_in_playlist,
         added_cues=result.added_cues,
         added_loops=result.added_loops,
+        pending_grid_alignment=getattr(result, "pending_grid_alignment", 0),
         backup_dir=str(result.backup_dir),
         missing=[
             {"content_id": t.content_id, "title": t.title, "folder_path": t.folder_path}

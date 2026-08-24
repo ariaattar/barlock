@@ -52,7 +52,7 @@ def test_heuristic_cue_layout_uses_phrase_landmarks():
     assert by_name["Phrase 16"].hotcue_slot == 1
     assert by_name["Phrase 16"].seconds == 32.5
     assert by_name["Phrase 32"].hotcue_slot == 2
-    assert by_name["Outro"].kind == "memory"
+    assert "Outro" not in by_name
     assert "Intro Loop" not in by_name
     assert "Exit Loop" not in by_name
 
@@ -81,8 +81,7 @@ def test_structural_cue_layout_uses_section_labels():
     assert by_name["Build"].hotcue_slot == 1
     assert by_name["Breakdown"].hotcue_slot == 5
     assert by_name["Last Drop"].hotcue_slot == 6
-    assert by_name["Outro"].kind == "memory"
-    assert by_name["Outro"].seconds == 192.0
+    assert "Outro" not in by_name
 
 
 def test_pad_c_is_drop_slot_in_both_modes():
