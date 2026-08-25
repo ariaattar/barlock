@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.artifacts/
+.pyinstaller/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/resources/engine/soundcloud-worker/
+src-tauri/icons/android/
+src-tauri/icons/ios/
+src-tauri/icons/Square*.png
+src-tauri/icons/StoreLogo.png
+src-tauri/icons/64x64.png

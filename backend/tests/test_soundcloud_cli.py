@@ -10,6 +10,7 @@ from app import soundcloud_cli as cli
 from app.soundcloud_common import features_to_dict
 from app.soundcloud_config import AppConfig
 from app.soundcloud_downloader import DownloadEntry, DownloadPlan
+from app.sync_state import SyncState
 
 
 def test_main_with_url_still_supports_dry_run(monkeypatch, capsys, tmp_path):
@@ -119,11 +120,12 @@ def test_bridge_push_uses_payload_features(monkeypatch, tmp_path):
     pushed: dict[str, object] = {}
     emitted: list[tuple[str, dict[str, object]]] = []
 
-    def fake_push(features, *, playlist_name, create_playlist, playlist_id=None):
+    def fake_push(features, *, playlist_name, create_playlist, playlist_id=None, cue_mode="off"):
         pushed["tracks"] = [item.title for item in features]
         pushed["playlist_name"] = playlist_name
         pushed["create_playlist"] = create_playlist
         pushed["playlist_id"] = playlist_id
+        pushed["cue_mode"] = cue_mode
         return SimpleNamespace(
             playlist_name=playlist_name,
             playlist_id="pl-1",
@@ -158,6 +160,7 @@ def test_bridge_push_uses_payload_features(monkeypatch, tmp_path):
         "playlist_name": "Set",
         "create_playlist": True,
         "playlist_id": None,
+        "cue_mode": "off",
     }
     assert emitted[-1][0] == "done"
 
@@ -175,6 +178,32 @@ def test_bridge_main_emits_clean_json_for_unexpected_errors(monkeypatch, capsys)
     assert payload["event"] == "error"
     assert payload["message"] == "Exception: db exploded"
     assert "Traceback" not in output.err
+
+
+def test_bridge_sync_resolves_plain_target_folder_under_downloads(monkeypatch, tmp_path):
+    state = SyncState(url="https://soundcloud.com/user/sets/demo")
+    saved: list[SyncState] = []
+    emitted: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr(bridge, "_load_payload", lambda _: {
+        "url": state.url,
+        "target_dir": "demo-set",
+        "analyze": False,
+        "write_tags": False,
+        "push": False,
+    })
+    monkeypatch.setattr(bridge, "load_config", lambda: AppConfig())
+    monkeypatch.setattr(bridge, "load_state", lambda _url: state)
+    monkeypatch.setattr(bridge, "save_state", lambda value: saved.append(value))
+    monkeypatch.setattr(bridge, "collect_download_plan", lambda _urls: DownloadPlan([], title="Demo Set"))
+    monkeypatch.setattr(bridge, "_emit", lambda event, **payload: emitted.append((event, payload)))
+
+    assert bridge._cmd_sync(SimpleNamespace(payload="-")) == 0
+
+    expected = tmp_path / "Downloads" / "demo-set"
+    assert expected.is_dir()
+    assert saved[0].target_dir == str(expected)
+    assert emitted[-1][1]["target_dir"] == str(expected)
 
 
 def test_parallel_analyze_preserves_order_and_uses_pool(monkeypatch, tmp_path):
@@ -295,10 +324,19 @@ def test_reanalyze_playlist_filters_by_content_ids_and_skips_missing(monkeypatch
 
     pushed: dict[str, object] = {}
 
-    def fake_push(features, *, playlist_name, create_playlist, playlist_id=None, remove_paths=None):
+    def fake_push(
+        features,
+        *,
+        playlist_name,
+        create_playlist,
+        playlist_id=None,
+        remove_paths=None,
+        cue_mode="off",
+    ):
         pushed["features"] = [Path(f.path).name for f in features]
         pushed["playlist_id"] = playlist_id
         pushed["create_playlist"] = create_playlist
+        pushed["cue_mode"] = cue_mode
         return SimpleNamespace(
             playlist_name=playlist_name,
             playlist_id=playlist_id or "pl-1",
@@ -333,6 +371,7 @@ def test_reanalyze_playlist_filters_by_content_ids_and_skips_missing(monkeypatch
     assert [p.name for p in analyzed_paths] == ["present.mp3"]
     assert pushed["features"] == ["present.mp3"]
     assert pushed["playlist_id"] == "pl-1"
+    assert pushed["cue_mode"] == "off"
     assert pushed["create_playlist"] is False
     final_event = next((p for ev, p in emitted if ev == "done"), None)
     assert final_event is not None

@@ -16,8 +16,11 @@ from .rekordbox_sync import (
     doctor,
     list_playlist_tracks,
     list_playlists,
+    list_usb_devices,
     open_rekordbox,
     push_tracks_to_playlist,
+    rekordbox_waveform,
+    remove_generated_cues_from_playlist,
     repair_generated_active_loops,
     repair_generated_off_grid_loops,
     rekordbox_running,
@@ -102,6 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_files_parser.set_defaults(handler=_cmd_write_import_files)
 
     subparsers.add_parser("rekordbox-running").set_defaults(handler=_cmd_rekordbox_running)
+    subparsers.add_parser("usb-status").set_defaults(handler=_cmd_usb_status)
     subparsers.add_parser("close-rekordbox").set_defaults(handler=_cmd_close_rekordbox)
     subparsers.add_parser("open-rekordbox").set_defaults(handler=_cmd_open_rekordbox)
     subparsers.add_parser("list-playlists").set_defaults(handler=_cmd_list_playlists)
@@ -118,6 +122,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("repair-generated-off-grid-loops").set_defaults(
         handler=_cmd_repair_generated_off_grid_loops
     )
+    remove_cues_parser = subparsers.add_parser("remove-generated-cues")
+    remove_cues_parser.add_argument("--playlist-id", required=True)
+    remove_cues_parser.set_defaults(handler=_cmd_remove_generated_cues)
 
     calibrate_parser = subparsers.add_parser("calibrate")
     calibrate_parser.add_argument("--manifest", required=True)
@@ -134,6 +141,11 @@ def build_parser() -> argparse.ArgumentParser:
     list_tracks_parser = subparsers.add_parser("list-playlist-tracks")
     list_tracks_parser.add_argument("--playlist-id", required=True)
     list_tracks_parser.set_defaults(handler=_cmd_list_playlist_tracks)
+
+    waveform_parser = subparsers.add_parser("rekordbox-waveform")
+    waveform_parser.add_argument("--content-id", required=True)
+    waveform_parser.add_argument("--max-points", type=int, default=2400)
+    waveform_parser.set_defaults(handler=_cmd_rekordbox_waveform)
 
     reanalyze_parser = subparsers.add_parser("reanalyze-playlist")
     reanalyze_parser.add_argument("--payload", default="-")
@@ -381,6 +393,11 @@ def _cmd_rekordbox_running(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_usb_status(_args: argparse.Namespace) -> int:
+    _print_json({"ok": True, "devices": list_usb_devices()})
+    return 0
+
+
 def _cmd_close_rekordbox(_args: argparse.Namespace) -> int:
     _print_json({"ok": True, "closed": close_rekordbox()})
     return 0
@@ -422,6 +439,7 @@ def _cmd_push(args: argparse.Namespace) -> int:
         playlist_name=playlist_name,
         playlist_id=payload.get("playlist_id") or None,
         create_playlist=bool(payload.get("create_playlist")),
+        cue_mode=str(payload.get("cue_mode") or "off"),
     )
     _emit(
         "done",
@@ -488,6 +506,20 @@ def _cmd_repair_generated_off_grid_loops(_args: argparse.Namespace) -> int:
                 }
                 for issue in result.repaired
             ],
+            "backup_dir": str(result.backup_dir) if result.backup_dir else "",
+        }
+    )
+    return 0
+
+
+def _cmd_remove_generated_cues(args: argparse.Namespace) -> int:
+    result = remove_generated_cues_from_playlist(str(args.playlist_id))
+    _print_json(
+        {
+            "ok": True,
+            "playlist_name": result.playlist_name,
+            "removed_cues": result.removed_cues,
+            "affected_tracks": result.affected_tracks,
             "backup_dir": str(result.backup_dir) if result.backup_dir else "",
         }
     )
@@ -587,9 +619,13 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     if not url:
         raise ValueError("payload.url is required")
     playlist_name_override = str(payload.get("playlist_name") or "").strip()
+    target_dir_override = str(payload.get("target_dir") or "").strip()
     do_analyze = bool(payload.get("analyze", True))
     do_tags = bool(payload.get("write_tags", True))
     do_push = bool(payload.get("push", True))
+    cue_mode = str(payload.get("cue_mode") or "off")
+    if cue_mode not in {"off", "fill"}:
+        raise ValueError(f"invalid cue mode: {cue_mode}")
 
     config = load_config()
     state = load_state(url)
@@ -598,7 +634,12 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     plan = collect_download_plan([url])
     entries = plan.entries
     title = plan.title or state.title or "SoundCloud"
-    target_dir = Path(state.target_dir) if state.target_dir else derive_target_dir(title)
+    if target_dir_override:
+        target_dir = Path(target_dir_override)
+        if not target_dir.is_absolute():
+            target_dir = Path.home() / "Downloads" / target_dir
+    else:
+        target_dir = Path(state.target_dir) if state.target_dir else derive_target_dir(title)
     target_dir = target_dir.expanduser()
     target_dir.mkdir(parents=True, exist_ok=True)
     archive = target_dir / f".{safe_slug(title)}.archive.txt"
@@ -683,7 +724,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     push_summary: dict[str, Any] = {}
     if do_push:
         if rekordbox_running():
-            raise RuntimeError("Close Rekordbox before sync (so cues can be written).")
+            raise RuntimeError("Close Rekordbox before sync so the playlist can be updated.")
         playlist_name = playlist_name_override or state.rekordbox_playlist or title
         playlist_id = state.rekordbox_playlist_id or None
         result = push_tracks_to_playlist(
@@ -692,6 +733,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
             playlist_id=playlist_id,
             create_playlist=True,
             remove_paths=[str(p) for p in removed_paths],
+            cue_mode=cue_mode,
         )
         push_summary = {
             "playlist_name": result.playlist_name,
@@ -757,6 +799,12 @@ def _cmd_list_playlist_tracks(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_rekordbox_waveform(args: argparse.Namespace) -> int:
+    result = rekordbox_waveform(str(args.content_id), max_points=int(args.max_points))
+    _print_json({"ok": True, "waveform": asdict(result)})
+    return 0
+
+
 def _cmd_reanalyze_playlist(args: argparse.Namespace) -> int:
     payload = _load_payload(args.payload)
     playlist_id = str(payload.get("playlist_id") or "").strip()
@@ -766,6 +814,9 @@ def _cmd_reanalyze_playlist(args: argparse.Namespace) -> int:
     if payload.get("content_ids"):
         selected_ids = {str(cid) for cid in payload["content_ids"]}
     force_no_cache = bool(payload.get("force_no_cache", True))
+    cue_mode = str(payload.get("cue_mode") or "off")
+    if cue_mode not in {"off", "fill"}:
+        raise ValueError(f"invalid cue mode: {cue_mode}")
 
     # Fail fast before doing any analysis work — analysis is expensive and the
     # push won't run if Rekordbox is open.
@@ -815,6 +866,7 @@ def _cmd_reanalyze_playlist(args: argparse.Namespace) -> int:
         playlist_name=playlist_name,
         playlist_id=playlist_id,
         create_playlist=False,
+        cue_mode=cue_mode,
     )
 
     _emit(

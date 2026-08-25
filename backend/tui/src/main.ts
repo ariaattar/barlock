@@ -263,8 +263,13 @@ class TuiApp {
           },
           {
             label: "Reanalyze a Rekordbox playlist",
-            description: "Re-run cue analysis on tracks already in Rekordbox",
+            description: "Refresh analysis/tags; optionally fill empty hot-cue slots",
             value: "reanalyze",
+          },
+          {
+            label: "Remove generated hot cues",
+            description: "Choose a Rekordbox playlist; manual cues are preserved",
+            value: "remove-cues",
           },
           {
             label: "Rekordbox doctor",
@@ -289,6 +294,8 @@ class TuiApp {
           await this.syncLikesFlow()
         } else if (choice === "reanalyze") {
           await this.reanalyzeFlow()
+        } else if (choice === "remove-cues") {
+          await this.removeGeneratedCuesFlow()
         } else if (choice === "doctor") {
           await this.doctorFlow()
         } else if (choice === "settings") {
@@ -514,8 +521,8 @@ class TuiApp {
       this.subtitle = parts.join("    →    ")
     }
     const stepLabels = prefilledUrl
-      ? ["Review sync", "Playlist name", "Analyze", "Confirm", "Run"]
-      : ["SoundCloud URL", "Review sync", "Playlist name", "Analyze", "Confirm", "Run"]
+      ? ["Review sync", "Playlist name", "Analyze", "Hot cues", "Confirm", "Run"]
+      : ["SoundCloud URL", "Review sync", "Playlist name", "Analyze", "Hot cues", "Confirm", "Run"]
     type SyncPlan = {
       url: string
       title: string
@@ -533,6 +540,7 @@ class TuiApp {
       plan?: SyncPlan
       playlistName?: string
       analyze?: boolean
+      cueMode?: "off" | "fill"
     } = {
       url: prefilledUrl || "",
     }
@@ -611,10 +619,29 @@ class TuiApp {
         } else if (current === "Analyze") {
           state.analyze = await this.confirm(
             "Analyze",
-            ["Analyze new tracks (BPM, key, cues) before pushing?"],
+            ["Analyze new tracks for BPM, key, energy, and tags before pushing?"],
             this.config.analyze_after_download,
             flow(),
           )
+          step += 1
+        } else if (current === "Hot cues") {
+          if (!state.analyze) {
+            state.cueMode = "off"
+            step += 1
+            continue
+          }
+          state.cueMode = await this.select("Generated Hot Cues", [
+            {
+              label: "Do not add hot cues",
+              description: "Default; existing cues are untouched",
+              value: "off" as const,
+            },
+            {
+              label: "Fill empty hot-cue slots only",
+              description: "Never moves, deletes, or overwrites an occupied slot",
+              value: "fill" as const,
+            },
+          ], { flow: flow() })
           step += 1
         } else if (current === "Confirm") {
           if (!state.plan) {
@@ -626,7 +653,10 @@ class TuiApp {
             state.plan.is_first_sync
               ? `${state.plan.total_count} new track(s) to download.`
               : `${state.plan.added.length} new   ${state.plan.removed_ids.length} removed   ${state.plan.unchanged_count} unchanged`,
-            state.analyze ? "Analyze enabled — cues will be written." : "Analyze disabled — collection only.",
+            state.analyze ? "Analysis enabled for BPM, key, energy, and tags." : "Analysis disabled — collection only.",
+            state.cueMode === "fill"
+              ? "Hot cues: fill empty slots only; existing cues will not be changed."
+              : "Hot cues: disabled; existing cues will not be changed.",
           ]
           const confirmed = await this.confirm("Confirm Sync", lines, true, flow())
           if (!confirmed) {
@@ -670,6 +700,7 @@ class TuiApp {
                 analyze: state.analyze ?? true,
                 write_tags: this.config.write_tags,
                 push: true,
+                cue_mode: state.cueMode || "off",
               },
               (event) => {
                 if (event.message) {
@@ -748,12 +779,13 @@ class TuiApp {
       file_exists: boolean
       soundcloud_dl_managed: boolean
     }
-    const stepLabels = ["Playlist", "Scope", "Confirm", "Run"]
+    const stepLabels = ["Playlist", "Scope", "Hot cues", "Confirm", "Run"]
     let step = 0
     let playlist: Playlist | undefined
     let tracks: TrackRow[] | undefined
     let scope: "all" | "subset" | undefined
     let selectedIds: string[] | undefined
+    let cueMode: "off" | "fill" = "off"
     const flow = () => ({
       name: "Reanalyze",
       step: step + 1,
@@ -771,6 +803,7 @@ class TuiApp {
             tracks = undefined
             scope = undefined
             selectedIds = undefined
+            cueMode = "off"
             step += 1
           } else if (current === "Scope") {
             if (!playlist) {
@@ -816,6 +849,20 @@ class TuiApp {
               selectedIds = tracks.filter((t) => t.file_exists).map((t) => t.content_id)
             }
             step += 1
+          } else if (current === "Hot cues") {
+            cueMode = await this.select("Generated Hot Cues", [
+              {
+                label: "Do not add hot cues",
+                description: "Existing cues are untouched",
+                value: "off" as const,
+              },
+              {
+                label: "Fill empty hot-cue slots only",
+                description: "Never moves, deletes, or overwrites an occupied slot",
+                value: "fill" as const,
+              },
+            ], { flow: flow() })
+            step += 1
           } else if (current === "Confirm") {
             if (!playlist || !tracks || !selectedIds) {
               step = Math.max(0, step - 1)
@@ -827,7 +874,9 @@ class TuiApp {
               `Reanalyze ${runnable.length} track(s) in "${playlist.name}".`,
               missing.length ? `${missing.length} track(s) have missing files and will be skipped.` : "",
               "Cache will be bypassed so the latest analyzer runs.",
-              "Auto-generated cues will be rewritten in Rekordbox.",
+              cueMode === "fill"
+                ? "Empty hot-cue slots may be filled; every existing cue remains untouched."
+                : "No Rekordbox cues will be added or changed.",
             ].filter(Boolean) as string[]
             const confirmed = await this.confirm("Confirm Reanalyze", lines, true, flow())
             if (!confirmed) {
@@ -868,6 +917,7 @@ class TuiApp {
                   playlist_id: playlist!.id,
                   content_ids: selectedIds,
                   force_no_cache: true,
+                  cue_mode: cueMode,
                 },
                 (event) => {
                   if (event.message) {
@@ -1114,6 +1164,107 @@ class TuiApp {
       } else {
         selected.add(choice)
       }
+    }
+  }
+
+  private async removeGeneratedCuesFlow(): Promise<void> {
+    const previousSubtitle = this.subtitle
+    const stepLabels = ["Playlist", "Confirm", "Run"]
+    let step = 0
+    let playlist: Playlist | undefined
+    const flow = () => ({
+      name: "Remove cues",
+      step: step + 1,
+      total: stepLabels.length,
+      label: stepLabels[step],
+    })
+
+    try {
+      while (step < stepLabels.length && this.running) {
+        try {
+          const current = stepLabels[step]
+          if (current === "Playlist") {
+            playlist = await this.pickRekordboxPlaylist(flow())
+            this.subtitle = `Rekordbox: ${playlist.path}`
+            step += 1
+          } else if (current === "Confirm") {
+            if (!playlist) {
+              step = 0
+              continue
+            }
+            const confirmed = await this.confirm(
+              "Remove Generated Hot Cues",
+              [
+                `Playlist: ${playlist.name}`,
+                `Tracks: ${playlist.song_count}`,
+                "Only SoundCloud DL-generated hot cues and loops will be removed.",
+                "Manual and unrecognized cues will remain untouched.",
+                "Cue changes affect these tracks everywhere in Rekordbox, not only this playlist.",
+              ],
+              false,
+              flow(),
+            )
+            if (!confirmed) {
+              return
+            }
+            step += 1
+          } else if (current === "Run") {
+            if (!playlist) {
+              step = 0
+              continue
+            }
+            const running = await this.bridge.json("rekordbox-running")
+            if (running.running) {
+              const action = await this.select("Rekordbox Is Open", [
+                {
+                  label: "Close Rekordbox and continue",
+                  description: "Required for the backed-up database update",
+                  value: "close" as const,
+                },
+                { label: "Cancel", value: "cancel" as const },
+              ], { flow: flow() })
+              if (action !== "close") {
+                return
+              }
+              await this.status("Closing Rekordbox", ["Asking Rekordbox to quit..."], async () => {
+                return await this.bridge.json("close-rekordbox")
+              }, flow())
+            }
+            const after = await this.bridge.json("rekordbox-running")
+            if (after.running) {
+              await this.message("Rekordbox Still Open", ["Close Rekordbox, then try again."], "Back", flow())
+              return
+            }
+            const result = await this.status("Removing Generated Hot Cues", [], async () => {
+              return await this.bridge.json("remove-generated-cues", ["--playlist-id", playlist!.id])
+            }, flow())
+            await this.message(
+              "Generated Hot Cues Removed",
+              [
+                `Playlist: ${result.playlist_name || playlist.name}`,
+                `Removed cues: ${result.removed_cues || 0}`,
+                `Affected tracks: ${result.affected_tracks || 0}`,
+                result.backup_dir ? `Backup: ${result.backup_dir}` : "No generated cues were found.",
+              ],
+              "Done",
+              flow(),
+              false,
+            )
+            return
+          }
+        } catch (error) {
+          if (error instanceof Back) {
+            if (step === 0) {
+              return
+            }
+            step -= 1
+            continue
+          }
+          throw error
+        }
+      }
+    } finally {
+      this.subtitle = previousSubtitle
     }
   }
 

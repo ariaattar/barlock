@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import plistlib
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from pyrekordbox import Rekordbox6Database, RekordboxXml
@@ -32,6 +35,7 @@ AUTO_CUE_NAMES = {
 AUTO_LOOP_NAMES = {"Intro Loop", "Exit Loop"}
 HOT_CUE_KINDS = (1, 2, 3, 5, 6, 7, 8, 9)
 RESERVED_EXTERNAL_SLOTS = {5, 6}  # zero-based hot cue slots only written on soundcloud-dl managed tracks
+CueWriteMode = Literal["off", "fill", "replace_generated"]
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,49 @@ class PushResult:
 
 def rekordbox_running() -> bool:
     return bool(get_rekordbox_pid())
+
+
+def list_usb_devices(volumes_dir: Path = Path("/Volumes")) -> list[dict[str, object]]:
+    if not volumes_dir.exists():
+        return []
+
+    devices: list[dict[str, object]] = []
+    for volume in sorted(volumes_dir.iterdir(), key=lambda path: path.name.lower()):
+        if volume.is_symlink() or volume.name.startswith("."):
+            continue
+        try:
+            result = subprocess.run(
+                ["diskutil", "info", "-plist", str(volume)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            if result.returncode != 0 or not result.stdout:
+                continue
+            info = plistlib.loads(result.stdout)
+        except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException):
+            continue
+
+        if bool(info.get("Internal")) or str(info.get("BusProtocol") or "") == "Disk Image":
+            continue
+        if not bool(info.get("RemovableMediaOrExternalDevice") or info.get("Ejectable")):
+            continue
+
+        mount_path = Path(str(info.get("MountPoint") or volume))
+        pioneer_root = mount_path / "PIONEER" / "rekordbox"
+        devices.append(
+            {
+                "name": str(info.get("VolumeName") or volume.name),
+                "mount_path": str(mount_path),
+                "filesystem": str(info.get("FilesystemUserVisibleName") or info.get("FilesystemType") or ""),
+                "total_bytes": int(info.get("TotalSize") or info.get("Size") or 0),
+                "free_bytes": int(info.get("FreeSpace") or 0),
+                "writable": bool(info.get("WritableVolume", info.get("Writable", False))),
+                "rekordbox_export": pioneer_root.exists(),
+            }
+        )
+    return devices
 
 
 def close_rekordbox(*, timeout_sec: float = 20.0) -> bool:
@@ -169,6 +216,55 @@ class GridLoopRepairResult:
     backup_dir: Path | None
 
 
+@dataclass(frozen=True)
+class GeneratedCueRemovalResult:
+    playlist_name: str
+    removed_cues: int
+    affected_tracks: int
+    backup_dir: Path | None
+
+
+@dataclass(frozen=True)
+class RekordboxWaveformLane:
+    tag: str
+    heights: list[float]
+    colors: list[list[int]]
+
+
+@dataclass(frozen=True)
+class RekordboxBeat:
+    beat_number: int
+    bpm: float
+    time_sec: float
+
+
+@dataclass(frozen=True)
+class RekordboxCuePoint:
+    id: str
+    kind: int
+    name: str
+    in_sec: float
+    out_sec: float | None
+    color: int
+    color_table_index: int
+    active_loop: bool
+    loop_beats: int
+
+
+@dataclass(frozen=True)
+class RekordboxWaveform:
+    source: str
+    content_id: str
+    title: str
+    duration_sec: float
+    fingerprint: str
+    files: list[dict[str, str | int]]
+    beat_grid: list[RekordboxBeat]
+    preview: RekordboxWaveformLane | None
+    detail: RekordboxWaveformLane | None
+    cues: list[RekordboxCuePoint]
+
+
 def list_playlist_tracks(playlist_id: str) -> list[PlaylistTrack]:
     db = Rekordbox6Database()
     try:
@@ -203,6 +299,161 @@ def list_playlist_tracks(playlist_id: str) -> list[PlaylistTrack]:
         return out
     finally:
         db.close()
+
+
+def rekordbox_waveform(content_id: str, *, max_points: int = 2400) -> RekordboxWaveform:
+    if max_points < 100 or max_points > 12000:
+        raise ValueError("max_points must be between 100 and 12000")
+
+    db = Rekordbox6Database()
+    try:
+        content = db.get_content(ID=content_id)
+        if content is None:
+            raise ValueError(f"track not found: {content_id}")
+
+        files = db.read_anlz_files(content)
+        if not files:
+            raise ValueError("Rekordbox analysis is not available for this track")
+
+        file_info: list[dict[str, str | int]] = []
+        fingerprint = hashlib.sha256()
+        tags: dict[str, object] = {}
+        for path, anlz in sorted(files.items(), key=lambda item: str(item[0])):
+            stat = path.stat()
+            fingerprint.update(path.suffix.upper().encode("ascii", errors="ignore"))
+            fingerprint.update(path.read_bytes())
+            file_info.append(
+                {
+                    "kind": path.suffix.upper().lstrip("."),
+                    "path": str(path),
+                    "mtime_ns": stat.st_mtime_ns,
+                    "size": stat.st_size,
+                }
+            )
+            for tag_name in ("PQTZ", "PWAV", "PWV3", "PWV4", "PWV5"):
+                if tag_name in anlz and tag_name not in tags:
+                    tags[tag_name] = anlz.get_tag(tag_name)
+
+        beat_grid: list[RekordboxBeat] = []
+        grid_tag = tags.get("PQTZ")
+        if grid_tag is not None:
+            for entry in grid_tag.content.entries:
+                beat_grid.append(
+                    RekordboxBeat(
+                        beat_number=int(entry.beat),
+                        bpm=round(float(entry.tempo) / 100.0, 2),
+                        time_sec=round(float(entry.time) / 1000.0, 3),
+                    )
+                )
+
+        preview = _rekordbox_waveform_lane(
+            tags.get("PWV4") or tags.get("PWAV"),
+            max_points=min(max_points, 1200),
+        )
+        detail = _rekordbox_waveform_lane(
+            tags.get("PWV5") or tags.get("PWV3"),
+            max_points=max_points,
+        )
+
+        cues = [
+            RekordboxCuePoint(
+                id=str(cue.ID),
+                kind=int(cue.Kind or 0),
+                name=str(cue.Comment or ""),
+                in_sec=round(float(cue.InMsec or 0) / 1000.0, 3),
+                out_sec=_rekordbox_cue_out_seconds(cue.OutMsec),
+                color=int(cue.Color or 0),
+                color_table_index=int(cue.ColorTableIndex or 0),
+                active_loop=bool(cue.ActiveLoop),
+                loop_beats=int(cue.BeatLoopSize or 0) >> 16,
+            )
+            for cue in db.get_cue(ContentID=content_id).all()
+        ]
+
+        duration = float(getattr(content, "Length", 0) or 0)
+        if duration <= 0 and beat_grid:
+            duration = beat_grid[-1].time_sec
+        return RekordboxWaveform(
+            source="rekordbox_anlz",
+            content_id=str(content.ID),
+            title=str(content.Title or Path(str(content.FolderPath or "")).stem),
+            duration_sec=round(duration, 3),
+            fingerprint=fingerprint.hexdigest(),
+            files=file_info,
+            beat_grid=beat_grid,
+            preview=preview,
+            detail=detail,
+            cues=cues,
+        )
+    finally:
+        db.close()
+
+
+def _rekordbox_waveform_lane(tag, *, max_points: int) -> RekordboxWaveformLane | None:
+    if tag is None:
+        return None
+
+    raw = tag.get()
+    tag_type = str(tag.type)
+    heights: list[float]
+    colors: list[list[int]]
+    if tag_type == "PWV5":
+        raw_heights, raw_colors = raw
+        heights = [max(0.0, min(1.0, float(value))) for value in raw_heights]
+        colors = [
+            [int(round(max(0, min(7, int(channel))) / 7.0 * 255.0)) for channel in color]
+            for color in raw_colors
+        ]
+    elif tag_type == "PWV4":
+        raw_heights, raw_colors, _ = raw
+        heights = [max(0.0, min(1.0, float(value[0]) / 127.0)) for value in raw_heights]
+        colors = [
+            [max(0, min(255, int(round(channel)))) for channel in color[0]]
+            for color in raw_colors
+        ]
+    else:
+        raw_heights, raw_luminance = raw
+        heights = [max(0.0, min(1.0, float(value) / 31.0)) for value in raw_heights]
+        colors = []
+        for value in raw_luminance:
+            brightness = int(round(92 + max(0, min(7, int(value))) / 7.0 * 130))
+            colors.append([42, min(255, brightness + 25), min(255, brightness + 58)])
+
+    sampled_heights, sampled_colors = _downsample_waveform(heights, colors, max_points=max_points)
+    return RekordboxWaveformLane(
+        tag=tag_type,
+        heights=[round(value, 4) for value in sampled_heights],
+        colors=sampled_colors,
+    )
+
+
+def _rekordbox_cue_out_seconds(value: object | None) -> float | None:
+    if value is None:
+        return None
+    milliseconds = float(value)
+    return round(milliseconds / 1000.0, 3) if milliseconds >= 0 else None
+
+
+def _downsample_waveform(
+    heights: list[float],
+    colors: list[list[int]],
+    *,
+    max_points: int,
+) -> tuple[list[float], list[list[int]]]:
+    if len(heights) <= max_points:
+        return heights, colors
+
+    sampled_heights: list[float] = []
+    sampled_colors: list[list[int]] = []
+    for output_index in range(max_points):
+        start = output_index * len(heights) // max_points
+        end = max(start + 1, (output_index + 1) * len(heights) // max_points)
+        bucket = heights[start:end]
+        local_index = max(range(len(bucket)), key=bucket.__getitem__)
+        source_index = start + local_index
+        sampled_heights.append(heights[source_index])
+        sampled_colors.append(colors[source_index])
+    return sampled_heights, sampled_colors
 
 
 def list_playlists() -> list[PlaylistInfo]:
@@ -248,11 +499,14 @@ def push_tracks_to_playlist(
     create_playlist: bool,
     playlist_id: str | None = None,
     remove_paths: list[str] | None = None,
+    cue_mode: CueWriteMode = "off",
 ) -> PushResult:
     if rekordbox_running():
         raise RuntimeError("Close Rekordbox before direct playlist push.")
     if not features and not remove_paths:
         raise ValueError("no tracks to push")
+    if cue_mode not in {"off", "fill", "replace_generated"}:
+        raise ValueError(f"invalid cue mode: {cue_mode}")
 
     backup_dir = backup_rekordbox()
     db = Rekordbox6Database()
@@ -297,16 +551,22 @@ def push_tracks_to_playlist(
                 existing_collection += 1
             _apply_metadata(db, content, item)
             _safe_flush(db)
-            grid_times_ms = _rekordbox_grid_times_ms(content)
-            if not grid_times_ms and any(hint.kind == "loop" for hint in item.cue_hints):
-                pending_grid_alignment += 1
-            cue_item = _snap_loop_hints_to_rekordbox_grid(item, grid_times_ms)
-            cue_added, cue_skipped, loop_added, loop_skipped = _sync_cue_hints(db, content, cue_item)
-            added_cues += cue_added
-            skipped_cues += cue_skipped
-            added_loops += loop_added
-            skipped_loops += loop_skipped
-            _safe_flush(db)
+            if cue_mode != "off":
+                grid_times_ms = _rekordbox_grid_times_ms(content)
+                if not grid_times_ms and any(hint.kind == "loop" for hint in item.cue_hints):
+                    pending_grid_alignment += 1
+                cue_item = _snap_loop_hints_to_rekordbox_grid(item, grid_times_ms)
+                cue_added, cue_skipped, loop_added, loop_skipped = _sync_cue_hints(
+                    db,
+                    content,
+                    cue_item,
+                    replace_generated=cue_mode == "replace_generated",
+                )
+                added_cues += cue_added
+                skipped_cues += cue_skipped
+                added_loops += loop_added
+                skipped_loops += loop_skipped
+                _safe_flush(db)
             if str(content.ID) in existing_playlist_ids:
                 existing_playlist += 1
                 continue
@@ -484,6 +744,68 @@ def repair_generated_off_grid_loops() -> GridLoopRepairResult:
         db.commit()
         return GridLoopRepairResult(
             repaired=[issue for _, _, issue in candidates],
+            backup_dir=backup_dir,
+        )
+    except Exception:
+        db.session.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def remove_generated_cues_from_playlist(playlist_id: str) -> GeneratedCueRemovalResult:
+    if rekordbox_running():
+        raise RuntimeError("Close Rekordbox before removing generated cues.")
+
+    db = Rekordbox6Database()
+    try:
+        playlist = db.get_playlist(ID=playlist_id)
+        if playlist is None:
+            raise ValueError(f"playlist not found: {playlist_id}")
+        if playlist.is_folder:
+            raise ValueError(f"'{playlist.Name}' is a folder, not a playlist")
+
+        candidates: list[tuple[object, object]] = []
+        seen_content_ids: set[str] = set()
+        for song in db.get_playlist_songs(PlaylistID=playlist.ID).all():
+            content_id = str(song.ContentID)
+            if content_id in seen_content_ids:
+                continue
+            seen_content_ids.add(content_id)
+            content = db.get_content(ID=content_id)
+            if content is None or not _is_soundcloud_dl_content(content):
+                continue
+            for cue in db.get_cue(ContentID=content_id).all():
+                if str(cue.Comment or "") in AUTO_CUE_NAMES:
+                    candidates.append((cue, content))
+
+        if not candidates:
+            return GeneratedCueRemovalResult(
+                playlist_name=str(playlist.Name or ""),
+                removed_cues=0,
+                affected_tracks=0,
+                backup_dir=None,
+            )
+
+        backup_dir = backup_rekordbox()
+        changed_content: dict[str, object] = {}
+        for cue, content in candidates:
+            db.delete(cue)
+            changed_content[str(content.ID)] = content
+        _safe_flush(db)
+
+        for content in changed_content.values():
+            try:
+                current = int(content.CueUpdated or 0)
+            except (TypeError, ValueError):
+                current = 0
+            content.CueUpdated = str(current + 1)
+
+        db.commit()
+        return GeneratedCueRemovalResult(
+            playlist_name=str(playlist.Name or ""),
+            removed_cues=len(candidates),
+            affected_tracks=len(changed_content),
             backup_dir=backup_dir,
         )
     except Exception:
@@ -744,11 +1066,17 @@ def _snap_loop_hints_to_rekordbox_grid(item: TrackFeatures, grid_times_ms: list[
     return replace(item, cue_hints=snapped)
 
 
-def _sync_cue_hints(db: Rekordbox6Database, content, item: TrackFeatures) -> tuple[int, int, int, int]:
+def _sync_cue_hints(
+    db: Rekordbox6Database,
+    content,
+    item: TrackFeatures,
+    *,
+    replace_generated: bool = True,
+) -> tuple[int, int, int, int]:
     existing = list(db.get_cue(ContentID=content.ID).all())
     removed_cues = 0
     is_managed = _is_soundcloud_dl_content(content)
-    if is_managed:
+    if is_managed and replace_generated:
         existing, removed_cues = _remove_generated_cues(db, existing)
     existing_hotcue_kinds = {int(cue.Kind) for cue in existing if cue.Kind and int(cue.Kind) > 0}
     existing_memory_ms = [

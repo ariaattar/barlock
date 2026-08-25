@@ -4,11 +4,15 @@ Guidance for coding agents working in this repository.
 
 ## Scope
 
-This repo is now focused on the SoundCloud/Rekordbox prep tool. The web frontend has been removed. Most active work should happen under `backend/`.
+This repo is focused on the SoundCloud/Rekordbox prep tool. The unrelated web frontend was removed. The maintained interfaces are the native Tauri desktop app and the OpenTUI terminal app under `backend/`.
 
 Core files:
 
 - `backend/tui/src/main.ts` - OpenTUI interactive terminal interface
+- `backend/desktop/src/App.tsx` - React interface hosted by Tauri
+- `backend/desktop/src-tauri/src/lib.rs` - native bridge to the packaged engine
+- `backend/desktop/engine/worker.py` - frozen desktop engine entrypoint
+- `backend/scripts/build_desktop_app.sh` - self-contained `.app` and DMG build
 - `backend/app/soundcloud_bridge.py` - JSON bridge for the TUI
 - `backend/app/soundcloud_cli.py` - plain Python URL/subcommand backend
 - `backend/app/soundcloud_downloader.py` - SoundCloud URL expansion and downloads
@@ -26,6 +30,13 @@ uv sync
 uv run pytest -q
 cd tui && bun install && bun run check && bun run smoke
 go build -o bin/soundcloud-dl ./cmd/soundcloud-dl
+cd desktop && bun install && bun run check && bun run test:e2e
+```
+
+Build the bundled desktop product from `backend/desktop/`:
+
+```bash
+bun run bundle
 ```
 
 To refresh the global local binary on this machine:
@@ -39,14 +50,19 @@ ln -sfn "$(pwd)/bin/soundcloud-dl" /opt/homebrew/bin/soundcloud-dl
 - Do not commit downloaded audio, Rekordbox database backups, virtualenvs, build artifacts, or local analysis caches.
 - Do not run direct Rekordbox database writes while Rekordbox is open.
 - Direct DB writes should continue to create a backup before mutating `master.db`.
-- Preserve user/manual Rekordbox cues. Only generated SoundCloud DL cues should be overwritten automatically.
+- Preserve user/manual Rekordbox cues. Do not overwrite existing cues during normal sync or reanalysis.
+- Hot-cue writing is opt-in. The normal sync and reanalysis default is off; fill mode may only write empty slots and must never delete, move, or overwrite an existing cue.
+- Cue removal must be an explicit playlist-scoped action, create a backup first, and remove only recognizable SoundCloud DL-generated cues on managed tracks.
+- Never present a locally decoded waveform as Rekordbox-accurate. Authoritative waveform views must come from the track's own ANLZ data and retain exact `PQTZ` timestamps.
+- Keep local waveform previews visibly labeled until Rekordbox has created ANLZ files.
+- Do not commit generated desktop bundles, PyInstaller output, Playwright artifacts, or Tauri build output.
 - Keep the normal user workflow interactive through `soundcloud-dl`.
 - Prefer improving the OpenTUI flow over adding extra required commands.
 - Workflow Back behavior should stay local to the current wizard step. Do not let nested prompts bubble directly back to the home menu unless the user backs out from the first step.
 
 ## Analysis And Cue Behavior
 
-The expected cue layout is:
+When optional hot-cue generation is enabled, the expected cue layout is:
 
 - A: `Intro`
 - B: `Phrase 16`
@@ -72,6 +88,7 @@ Before pushing:
 
 ```bash
 uv run pytest -q
+cd desktop && bun run check && bun run test:e2e
 ```
 
 If the launcher changes:

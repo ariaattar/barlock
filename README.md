@@ -1,6 +1,8 @@
 # SoundCloud DL for Rekordbox
 
-OpenTUI SoundCloud downloader, audio analyzer, and Rekordbox playlist importer for DJ prep.
+Desktop and OpenTUI SoundCloud downloader, audio analyzer, and Rekordbox playlist importer for DJ prep.
+
+The macOS desktop app is the primary visual workflow. It ships as one application bundle containing the Tauri/React interface, Python engine, yt-dlp, audio analysis stack, and ffmpeg. The existing interactive terminal workflow remains available through:
 
 The main entrypoint is:
 
@@ -23,11 +25,53 @@ Use it to pull SoundCloud tracks, public playlists, or likes, analyze the local 
 - Pushes directly into an existing or new Rekordbox playlist
 - Picks up the SoundCloud playlist title as the default Rekordbox playlist name
 - Backs up Rekordbox database files before direct database writes
+- Reads Rekordbox's own ANLZ beat grid, color waveform, cues, and loops for an authoritative track inspector
+- Detects mounted export USB devices and whether a Pioneer/Rekordbox export is present
+- Provides a native macOS desktop app with persistent jobs, guarded Rekordbox handoff, and delta-aware imports
 - Uses an OpenTUI interactive terminal app with arrow-key menus and back navigation
+
+## Desktop App
+
+The desktop app supports the complete prep workflow without requiring a separate backend process:
+
+- Resolve a SoundCloud track, public playlist, or likes URL and review its delta before starting.
+- Download into a named folder under `~/Downloads`, with optional BPM/key/energy analysis and ID3 tags.
+- Select or create a Rekordbox playlist, with hot cues off by default and an opt-in `Fill empty slots` policy.
+- Persist job progress and resume a blocked Rekordbox-close handoff from Activity.
+- Inspect collection playlists and tracks using Rekordbox's own ANLZ data.
+- Run Doctor checks, guarded loop repairs, and playlist-scoped removal of generated cues.
+
+### Rekordbox-accurate waveforms
+
+The track inspector does not redraw an approximation and label it as Rekordbox data. For tracks already analyzed by Rekordbox it reads:
+
+- `PQTZ` for exact beat numbers, BPM changes, and grid timestamps
+- `PWV4`/`PWAV` for the full-track overview
+- `PWV5`/`PWV3` for color detail
+- Rekordbox database cue and loop timestamps for overlays
+
+The response includes an ANLZ fingerprint so rewritten analysis files invalidate the displayed waveform. A track without ANLZ files is visibly labeled `Local preview` until Rekordbox analyzes it.
+
+Build the self-contained local app and DMG:
+
+```bash
+cd backend/desktop
+bun install
+bun run bundle
+```
+
+Artifacts are written to:
+
+```text
+backend/desktop/src-tauri/target/release/bundle/macos/SoundCloud DL.app
+backend/desktop/src-tauri/target/release/bundle/dmg/SoundCloud DL_0.1.0_aarch64.dmg
+```
+
+The local build is ad-hoc signed when no Apple Developer signing identity is configured. Public distribution still requires Developer ID signing and notarization.
 
 ## Cue Layout
 
-The auto cue layout is designed for fast house and tech-house prep:
+Optional generated hot cues are designed for fast house and tech-house prep:
 
 | Pad | Cue | Purpose |
 | --- | --- | --- |
@@ -40,6 +84,8 @@ The auto cue layout is designed for fast house and tech-house prep:
 D and E are conservative. The analyzer prefers clean 4 or 8 beat loops that start and end on beat-grid lines, favors the first clean beat after pickup or transition hits, and skips a loop when the section looks unstable, faded, or transition-heavy. Bad automatic loops are worse than missing loops.
 
 The tool does not create memory cues. Some XDJ load settings jump to a stored memory cue, so the generated exit marker remains hot cue E instead of a red late-track memory marker.
+
+Hot-cue writing is disabled by default. During sync or reanalysis, choose `Fill empty hot-cue slots only` to add generated cues without moving, deleting, or overwriting anything already stored in Rekordbox. The home menu also includes `Remove generated hot cues`, scoped to a selected playlist and backed up before deletion.
 
 ## Install
 
@@ -89,9 +135,9 @@ Rekordbox sync flow:
 1. Choose `Sync a SoundCloud URL`.
 2. Paste a SoundCloud track, playlist, or likes URL.
 3. Review deltas and the auto-picked playlist name.
-4. Confirm analysis and Rekordbox import.
-5. Close Rekordbox when prompted so cues and playlist changes can be written.
-6. For newly imported tracks, let the CLI open Rekordbox for device-grid analysis, then return to the CLI to close Rekordbox and align D/E loops before export.
+4. Confirm analysis and choose whether to leave cues disabled or fill empty hot-cue slots.
+5. Close Rekordbox when prompted so playlist changes can be written.
+6. If empty cue slots were filled on newly imported tracks, let the CLI open Rekordbox for device-grid analysis, then return to the CLI to close Rekordbox and align D/E loops before export.
 
 Likes sync prompts for a SoundCloud username. The entered username is saved as
 the default for the next run and can be changed at any time.
@@ -123,7 +169,8 @@ Direct push:
 - Adds missing tracks to the collection
 - Adds new tracks to the playlist without duplicating existing playlist rows
 - Updates metadata for tracks managed by this tool
-- Rewrites generated SoundCloud DL cues by default
+- Leaves existing Rekordbox cues untouched by default
+- Optionally fills empty hot-cue slots without replacing occupied slots
 - Detects new tracks without a Rekordbox beat grid and offers an in-flow analysis/finalization pass
 - Preserves cues that were not generated by this tool
 - Creates a timestamped backup in `~/Library/Pioneer/rekordbox/backups`
@@ -168,6 +215,16 @@ cd tui && bun install && bun run check && bun run smoke && cd ..
 uv run pytest -q
 ```
 
+Desktop development and verification:
+
+```bash
+cd backend/desktop
+bun install
+bun run check
+bun run test:e2e
+bun run tauri dev
+```
+
 Rebuild the launcher:
 
 ```bash
@@ -186,6 +243,10 @@ bun run start
 
 ```text
 backend/tui/src/main.ts               OpenTUI interactive terminal UI
+backend/desktop/src/App.tsx           Native desktop product interface
+backend/desktop/src-tauri/src/lib.rs  Tauri-to-Python streaming bridge
+backend/desktop/engine/worker.py      Frozen desktop engine entrypoint
+backend/scripts/build_desktop_*.sh    Self-contained app and DMG packaging
 backend/app/soundcloud_bridge.py      JSON bridge used by the TUI
 backend/app/soundcloud_cli.py         Plain Python URL/subcommand backend
 backend/app/soundcloud_downloader.py  SoundCloud expansion and parallel downloads
@@ -193,6 +254,7 @@ backend/app/audio_features.py         BPM/key/energy/cue and loop analysis
 backend/app/rekordbox_sync.py         Rekordbox import files and direct DB push
 backend/cmd/soundcloud-dl/main.go     Small global launcher binary
 backend/tests/                        Test suite
+docs/desktop-app-product-plan.md      Desktop behavior and architecture contract
 ```
 
 ## Notes

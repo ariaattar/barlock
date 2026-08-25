@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import plistlib
 from types import SimpleNamespace
 from xml.etree import ElementTree
 
@@ -8,12 +9,17 @@ from app.audio_features import CueHint, TrackFeatures
 from app.rekordbox_sync import (
     _beat_loop_size,
     _cue_kind,
+    _downsample_waveform,
     _ensure_content,
     _get_or_add_artist,
+    _rekordbox_cue_out_seconds,
+    _rekordbox_waveform_lane,
     _snap_loop_hints_to_rekordbox_grid,
     _sync_cue_hints,
+    list_usb_devices,
     repair_generated_active_loops,
     repair_generated_off_grid_loops,
+    remove_generated_cues_from_playlist,
     write_rekordbox_xml,
 )
 
@@ -97,6 +103,47 @@ class ActiveLoopDb:
 
     def query(self, *_args):
         return ActiveLoopQuery(self.rows)
+
+    def commit(self):
+        self.committed = True
+
+    def close(self):
+        self.closed = True
+
+    def _rollback(self):
+        self.rolled_back = True
+
+
+class CueRemovalDb:
+    def __init__(self, contents, cues):
+        self.contents = contents
+        self.cues = cues
+        self.playlist = SimpleNamespace(ID="playlist-1", Name="Set", is_folder=False)
+        self.deleted = []
+        self.committed = False
+        self.closed = False
+        self.rolled_back = False
+        self.session = SimpleNamespace(rollback=self._rollback)
+
+    def get_playlist(self, **kwargs):
+        return self.playlist if kwargs.get("ID") == self.playlist.ID else None
+
+    def get_playlist_songs(self, **kwargs):
+        assert kwargs["PlaylistID"] == self.playlist.ID
+        return FakeQuery([SimpleNamespace(ContentID=content_id) for content_id in self.contents])
+
+    def get_content(self, **kwargs):
+        content = self.contents.get(str(kwargs["ID"]))
+        return content
+
+    def get_cue(self, **kwargs):
+        return FakeQuery(self.cues.get(str(kwargs["ContentID"]), []))
+
+    def delete(self, instance):
+        self.deleted.append(instance)
+
+    def flush(self):
+        pass
 
     def commit(self):
         self.committed = True
@@ -280,8 +327,125 @@ def test_repair_generated_off_grid_loops_snaps_only_managed_four_or_eight_beat_l
     assert db.closed is True
 
 
+def test_remove_generated_cues_from_playlist_preserves_manual_and_external_cues(monkeypatch, tmp_path):
+    from app import rekordbox_sync
+
+    managed = SimpleNamespace(
+        ID="track-1",
+        Commnt="soundcloud-dl | https://soundcloud.com/a/b",
+        CueUpdated="4",
+    )
+    external = SimpleNamespace(ID="track-2", Commnt="", CueUpdated="2")
+    generated = SimpleNamespace(Comment="Intro")
+    generated_loop = SimpleNamespace(Comment="Exit Loop")
+    manual = SimpleNamespace(Comment="My Cue")
+    external_named_like_generated = SimpleNamespace(Comment="Intro")
+    db = CueRemovalDb(
+        {"track-1": managed, "track-2": external},
+        {
+            "track-1": [generated, generated_loop, manual],
+            "track-2": [external_named_like_generated],
+        },
+    )
+    backup = tmp_path / "backup"
+
+    monkeypatch.setattr(rekordbox_sync, "Rekordbox6Database", lambda: db)
+    monkeypatch.setattr(rekordbox_sync, "rekordbox_running", lambda: False)
+    monkeypatch.setattr(rekordbox_sync, "backup_rekordbox", lambda: backup)
+
+    result = remove_generated_cues_from_playlist("playlist-1")
+
+    assert db.deleted == [generated, generated_loop]
+    assert all(cue is not manual for cue in db.deleted)
+    assert all(cue is not external_named_like_generated for cue in db.deleted)
+    assert managed.CueUpdated == "5"
+    assert external.CueUpdated == "2"
+    assert result.playlist_name == "Set"
+    assert result.removed_cues == 2
+    assert result.affected_tracks == 1
+    assert result.backup_dir == backup
+    assert db.committed is True
+    assert db.closed is True
+
+
 def test_beat_loop_size_uses_rekordbox_encoding():
     assert _beat_loop_size(CueHint("Loop", 1.0, "loop", 1, 5.0, 8)) == 524289
+
+
+def test_rekordbox_color_waveform_lane_preserves_peak_colors_and_downsamples():
+    tag = SimpleNamespace(
+        type="PWV5",
+        get=lambda: (
+            [0.1, 0.8, 0.3, 0.5],
+            [[0, 1, 2], [7, 6, 5], [3, 4, 5], [1, 2, 3]],
+        ),
+    )
+
+    lane = _rekordbox_waveform_lane(tag, max_points=2)
+
+    assert lane is not None
+    assert lane.tag == "PWV5"
+    assert lane.heights == [0.8, 0.5]
+    assert lane.colors == [[255, 219, 182], [36, 73, 109]]
+
+
+def test_downsample_waveform_uses_max_height_from_each_stable_bucket():
+    heights, colors = _downsample_waveform(
+        [0.1, 0.7, 0.2, 0.9, 0.4, 0.3],
+        [[1, 1, 1], [2, 2, 2], [3, 3, 3], [4, 4, 4], [5, 5, 5], [6, 6, 6]],
+        max_points=3,
+    )
+
+    assert heights == [0.7, 0.9, 0.4]
+    assert colors == [[2, 2, 2], [4, 4, 4], [5, 5, 5]]
+
+
+def test_rekordbox_cue_out_seconds_treats_negative_sentinel_as_unset():
+    assert _rekordbox_cue_out_seconds(None) is None
+    assert _rekordbox_cue_out_seconds(-1) is None
+    assert _rekordbox_cue_out_seconds(194_842) == 194.842
+
+
+def test_list_usb_devices_excludes_disk_images_and_reports_rekordbox_exports(monkeypatch, tmp_path):
+    usb = tmp_path / "DJ USB"
+    disk_image = tmp_path / "Installer"
+    (usb / "PIONEER" / "rekordbox").mkdir(parents=True)
+    disk_image.mkdir()
+
+    def fake_run(command, **_kwargs):
+        path = command[-1]
+        if path == str(usb):
+            payload = {
+                "Internal": False,
+                "BusProtocol": "USB",
+                "RemovableMediaOrExternalDevice": True,
+                "MountPoint": str(usb),
+                "VolumeName": "DJ USB",
+                "FilesystemType": "exfat",
+                "TotalSize": 64_000,
+                "FreeSpace": 40_000,
+                "WritableVolume": True,
+            }
+        else:
+            payload = {
+                "Internal": False,
+                "BusProtocol": "Disk Image",
+                "RemovableMediaOrExternalDevice": True,
+                "MountPoint": str(disk_image),
+            }
+        return SimpleNamespace(returncode=0, stdout=plistlib.dumps(payload))
+
+    monkeypatch.setattr("app.rekordbox_sync.subprocess.run", fake_run)
+
+    assert list_usb_devices(tmp_path) == [{
+        "name": "DJ USB",
+        "mount_path": str(usb),
+        "filesystem": "exfat",
+        "total_bytes": 64_000,
+        "free_bytes": 40_000,
+        "writable": True,
+        "rekordbox_export": True,
+    }]
 
 
 def test_sync_cue_hints_adds_missing_hot_and_memory_cues():
@@ -376,6 +540,42 @@ def test_sync_cue_hints_skips_loop_when_hotcue_slot_exists():
     assert skipped_loops == 1
     assert db.added == []
     assert db.deleted == []
+
+
+def test_sync_cue_hints_fill_mode_never_replaces_existing_slots():
+    existing = [
+        SimpleNamespace(Kind=1, InMsec=500, Comment="Intro"),
+        SimpleNamespace(Kind=6, InMsec=180000, Comment="My Exit"),
+    ]
+    db = FakeDb(existing)
+    content = SimpleNamespace(
+        ID="track-1",
+        UUID="uuid-1",
+        HotCueAutoLoad=None,
+        CueUpdated="2",
+        Commnt="soundcloud-dl | https://soundcloud.com/test",
+    )
+    features = _features(
+        [
+            CueHint("Intro", 1.0, "hot", 0),
+            CueHint("Phrase 16", 30.0, "hot", 1),
+            CueHint("Exit Loop", 180.0, "loop", 4, 184.0, 8),
+        ]
+    )
+
+    added, skipped, added_loops, skipped_loops = _sync_cue_hints(
+        db,
+        content,
+        features,
+        replace_generated=False,
+    )
+
+    assert db.deleted == []
+    assert [(cue.Kind, cue.Comment) for cue in db.added] == [(2, "Phrase 16")]
+    assert added == 1
+    assert skipped == 1
+    assert added_loops == 0
+    assert skipped_loops == 1
 
 
 def test_sync_cue_hints_replaces_old_soundcloud_dl_auto_cues():
