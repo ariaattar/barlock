@@ -617,12 +617,18 @@ class TuiApp {
           updateSubtitle()
           step += 1
         } else if (current === "Analyze") {
-          state.analyze = await this.confirm(
-            "Analyze",
-            ["Analyze new tracks for BPM, key, energy, and tags before pushing?"],
-            this.config.analyze_after_download,
-            flow(),
-          )
+          state.analyze = await this.select("Audio Analysis", [
+            {
+              label: "Analyze before import",
+              description: "Detect BPM, key, energy, sections, and optional hot cues",
+              value: true,
+            },
+            {
+              label: "Skip audio analysis",
+              description: "Still downloads and imports tracks into the Rekordbox playlist",
+              value: false,
+            },
+          ], { defaultIndex: this.config.analyze_after_download ? 0 : 1, flow: flow() })
           step += 1
         } else if (current === "Hot cues") {
           if (!state.analyze) {
@@ -653,7 +659,9 @@ class TuiApp {
             state.plan.is_first_sync
               ? `${state.plan.total_count} new track(s) to download.`
               : `${state.plan.added.length} new   ${state.plan.removed_ids.length} removed   ${state.plan.unchanged_count} unchanged`,
-            state.analyze ? "Analysis enabled for BPM, key, energy, and tags." : "Analysis disabled — collection only.",
+            state.analyze
+              ? "Audio analysis: on for BPM, key, energy, sections, and tags."
+              : "Audio analysis: off. Tracks will still download and import.",
             state.cueMode === "fill"
               ? "Hot cues: fill empty slots only; existing cues will not be changed."
               : "Hot cues: disabled; existing cues will not be changed.",
@@ -1689,7 +1697,6 @@ class TuiApp {
 
   private clear(): void {
     for (const child of [...this.renderer.root.getChildren()]) {
-      this.renderer.root.remove(child.id)
       child.destroyRecursively()
     }
   }

@@ -10,7 +10,14 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from .audio_features import TrackFeatures, analyze_file, analyze_one_worker, audio_files, write_id3_tags
+from .audio_features import (
+    TrackFeatures,
+    analyze_file,
+    analyze_one_worker,
+    audio_files,
+    metadata_only_features,
+    write_id3_tags,
+)
 from .rekordbox_sync import (
     close_rekordbox,
     doctor,
@@ -705,19 +712,26 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     url_by_id = {entry.id: entry.url for entry in entries if entry.id}
     features: list[TrackFeatures] = []
     if (do_analyze or do_push) and current_paths:
-        _emit("status", message=f"Analyzing {len(current_paths)} track(s)...")
-        raw_features = _analyze_paths_parallel(
-            current_paths,
-            output_dir=target_dir,
-            extract_vocal_stems=config.extract_vocal_stems,
-        )
+        if do_analyze:
+            _emit("status", message=f"Analyzing {len(current_paths)} track(s)...")
+            raw_features = _analyze_paths_parallel(
+                current_paths,
+                output_dir=target_dir,
+                extract_vocal_stems=config.extract_vocal_stems,
+            )
+        else:
+            _emit(
+                "status",
+                message=f"Preparing {len(current_paths)} track(s) for import without audio analysis...",
+            )
+            raw_features = [metadata_only_features(path) for path in current_paths]
         for item in raw_features:
             source_url = url_by_id.get(item.source_id, item.source_url)
             if source_url:
                 item = replace(item, source_url=source_url)
             features.append(item)
 
-    if do_tags and features:
+    if do_analyze and do_tags and features:
         for item in features:
             write_id3_tags(Path(item.path), item)
 
@@ -770,7 +784,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         added=len(diff.added_ids),
         removed=len(diff.removed_ids),
         unchanged=len(diff.unchanged_ids),
-        analyzed=len(features),
+        analyzed=len(features) if do_analyze else 0,
         failed_downloads=failed_downloads,
         push=push_summary,
         features=[features_to_dict(item) for item in features],

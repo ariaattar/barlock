@@ -7,6 +7,8 @@ dependencies = [
     "numpy>=1.26,<2.0",
     "soundfile>=0.12",
     "librosa>=0.10.2",
+    # Numba 0.67.0 segfaults in librosa's beat tracker on macOS arm64.
+    "numba==0.61.2",
     "pyrekordbox>=0.4",
     "yt-dlp>=2025.1.15",
     "imageio-ffmpeg>=0.5.1",

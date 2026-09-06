@@ -150,6 +150,31 @@ def analyze_paths(paths: Iterable[Path], *, output_dir: Path, use_cache: bool = 
     return [analyze_file(path, output_dir=output_dir, use_cache=use_cache) for path in paths]
 
 
+def metadata_only_features(path: Path) -> TrackFeatures:
+    """Build the minimum track record needed for import without audio analysis."""
+    path = path.expanduser().resolve()
+    title, artist = _title_artist_from_filename(path)
+    file_info = sf.info(str(path))
+    return TrackFeatures(
+        path=str(path),
+        title=title,
+        artist=artist,
+        duration_sec=round(float(file_info.duration), 3),
+        sample_rate=int(file_info.samplerate or 0),
+        bpm=0.0,
+        musical_key="",
+        camelot_key="",
+        key_confidence=0.0,
+        loudness_dbfs=0.0,
+        peak_dbfs=0.0,
+        energy=0,
+        first_downbeat_sec=0.0,
+        cue_hints=[],
+        source_id=_source_id_from_filename(path),
+        analysis_version=0,
+    )
+
+
 def analyze_one_worker(args: tuple[str, str, bool, bool]) -> TrackFeatures:
     """Picklable entry point for process-pool workers.
 

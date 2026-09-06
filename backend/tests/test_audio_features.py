@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 
 from app.audio_features import (
     CueHint,
@@ -24,6 +25,7 @@ from app.audio_features import (
     _title_artist_from_filename,
     _vocal_overlap_fraction,
     camelot_key,
+    metadata_only_features,
 )
 
 
@@ -41,6 +43,22 @@ def test_filename_metadata_parsing_with_soundcloud_id():
     assert artist == "ABBA"
     assert title == "Gimme! Gimme! Gimme! (VIZON Remix)"
     assert _source_id_from_filename(path) == "2256704372"
+
+
+def test_metadata_only_features_reads_file_without_analysis(tmp_path):
+    path = tmp_path / "Artist - Track [12345].wav"
+    sf.write(path, np.zeros(22050, dtype=np.float32), 22050)
+
+    features = metadata_only_features(path)
+
+    assert features.title == "Track"
+    assert features.artist == "Artist"
+    assert features.source_id == "12345"
+    assert features.duration_sec == 1.0
+    assert features.sample_rate == 22050
+    assert features.bpm == 0.0
+    assert features.cue_hints == []
+    assert features.analysis_version == 0
 
 
 def test_heuristic_cue_layout_uses_phrase_landmarks():

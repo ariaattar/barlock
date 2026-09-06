@@ -206,6 +206,71 @@ def test_bridge_sync_resolves_plain_target_folder_under_downloads(monkeypatch, t
     assert emitted[-1][1]["target_dir"] == str(expected)
 
 
+def test_bridge_sync_without_analysis_uses_metadata_only_features(monkeypatch, tmp_path):
+    url = "https://soundcloud.com/user/likes"
+    track = tmp_path / "Artist - Track [12345].mp3"
+    track.write_bytes(b"audio")
+    entry = DownloadEntry(url="https://soundcloud.com/user/track", id="12345", title="Track")
+    state = SyncState(url=url, target_dir=str(tmp_path), track_ids=["12345"])
+    pushed: dict[str, object] = {}
+    emitted: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr(bridge, "_load_payload", lambda _: {
+        "url": url,
+        "playlist_name": "Likes",
+        "analyze": False,
+        "write_tags": True,
+        "push": True,
+        "cue_mode": "off",
+    })
+    monkeypatch.setattr(bridge, "load_config", AppConfig)
+    monkeypatch.setattr(bridge, "load_state", lambda _url: state)
+    monkeypatch.setattr(bridge, "save_state", lambda _state: None)
+    monkeypatch.setattr(
+        bridge,
+        "collect_download_plan",
+        lambda _urls: DownloadPlan([entry], title="Likes"),
+    )
+    monkeypatch.setattr(bridge, "paths_for_entries", lambda _folder, _entries: [track])
+    monkeypatch.setattr(
+        bridge,
+        "_analyze_paths_parallel",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("analyzer should not run")),
+    )
+    monkeypatch.setattr(bridge, "metadata_only_features", lambda path: _features(path))
+    monkeypatch.setattr(
+        bridge,
+        "write_id3_tags",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("tags should not be written")),
+    )
+    monkeypatch.setattr(bridge, "rekordbox_running", lambda: False)
+
+    def fake_push(features, **kwargs):
+        pushed["paths"] = [item.path for item in features]
+        pushed["cue_mode"] = kwargs["cue_mode"]
+        return SimpleNamespace(
+            playlist_name="Likes",
+            playlist_id="pl-1",
+            added_to_collection=1,
+            already_in_collection=0,
+            added_to_playlist=1,
+            already_in_playlist=0,
+            removed_from_playlist=0,
+            added_cues=0,
+            added_loops=0,
+            backup_dir=tmp_path / "backup",
+            pending_grid_alignment=0,
+        )
+
+    monkeypatch.setattr(bridge, "push_tracks_to_playlist", fake_push)
+    monkeypatch.setattr(bridge, "_emit", lambda event, **payload: emitted.append((event, payload)))
+
+    assert bridge._cmd_sync(SimpleNamespace(payload="-")) == 0
+    assert pushed == {"paths": [str(track)], "cue_mode": "off"}
+    assert emitted[-1][1]["analyzed"] == 0
+    assert any("without audio analysis" in str(payload.get("message", "")) for _, payload in emitted)
+
+
 def test_parallel_analyze_preserves_order_and_uses_pool(monkeypatch, tmp_path):
     """With >= 3 paths, the helper dispatches through ProcessPoolExecutor and
     returns results in the original input order."""
