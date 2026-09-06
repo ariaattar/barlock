@@ -89,15 +89,56 @@ Hot-cue writing is disabled by default. During sync or reanalysis, choose `Fill 
 
 ## Install
 
-From the repo root:
+On a Mac, open **Terminal**, paste this entire block, and press **Return**. It
+installs the required tools, downloads the project, builds the interactive
+terminal app, and starts it. You can safely run the same block again later to
+update and rebuild the app.
 
 ```bash
+set -e
+
+if ! command -v brew >/dev/null 2>&1 \
+  && [ ! -x /opt/homebrew/bin/brew ] \
+  && [ ! -x /usr/local/bin/brew ]; then
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+fi
+
+if [ -x /opt/homebrew/bin/brew ]; then
+  eval "$(/opt/homebrew/bin/brew shellenv)"
+else
+  eval "$(/usr/local/bin/brew shellenv)"
+fi
+
+brew install git go uv bun
+
+if [ -d "$HOME/barlock/.git" ]; then
+  cd "$HOME/barlock"
+  git pull --ff-only
+else
+  git clone https://github.com/ariaattar/barlock.git "$HOME/barlock"
+  cd "$HOME/barlock"
+fi
+
 cd backend
-uv sync
-cd tui && bun install && cd ..
+uv python install 3.12
+uv sync --python 3.12
+
+cd tui
+bun install
+bun run check
+bun run smoke
+cd ..
+
+mkdir -p bin
 go build -o bin/soundcloud-dl ./cmd/soundcloud-dl
-ln -sfn "$(pwd)/bin/soundcloud-dl" /opt/homebrew/bin/soundcloud-dl
+ln -sfn "$(pwd)/bin/soundcloud-dl" "$(brew --prefix)/bin/soundcloud-dl"
+
+soundcloud-dl --help
+soundcloud-dl
 ```
+
+The final command opens the app. After installation, open Terminal and run
+`soundcloud-dl` whenever you want to use it.
 
 Requirements:
 
