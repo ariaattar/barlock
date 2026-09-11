@@ -386,7 +386,58 @@ def test_rekordbox_color_waveform_lane_preserves_peak_colors_and_downsamples():
     assert lane is not None
     assert lane.tag == "PWV5"
     assert lane.heights == [0.8, 0.5]
-    assert lane.colors == [[255, 219, 182], [36, 73, 109]]
+    assert lane.colors == [[255, 182, 219], [36, 109, 73]]
+    assert lane.sample_rate_hz == 150
+    assert lane.source_points == 4
+
+
+def test_rekordbox_three_band_detail_preserves_native_byte_order_and_timing():
+    tag = SimpleNamespace(
+        type="PWV7",
+        content=SimpleNamespace(
+            len_entries=4,
+            entries=bytes([
+                20, 30, 40,
+                40, 50, 60,
+                60, 70, 80,
+                80, 90, 100,
+            ]),
+        ),
+    )
+
+    lane = _rekordbox_waveform_lane(tag, max_points=2)
+
+    assert lane is not None
+    assert lane.tag == "PWV7"
+    assert lane.style == "three_band"
+    assert lane.sample_rate_hz == 150
+    assert lane.source_points == 4
+    assert lane.bands == {
+        "low": [50.0, 90.0],
+        "mid": [30.0, 70.0],
+        "high": [40.0, 80.0],
+    }
+
+
+def test_rekordbox_three_band_preview_uses_cumulative_native_layers():
+    tag = SimpleNamespace(
+        type="PWV6",
+        content=SimpleNamespace(
+            len_entries=2,
+            entries=bytes([10, 20, 30, 40, 50, 60]),
+        ),
+    )
+
+    lane = _rekordbox_waveform_lane(tag, max_points=100)
+
+    assert lane is not None
+    assert lane.tag == "PWV6"
+    assert lane.sample_rate_hz is None
+    assert lane.source_points == 2
+    assert lane.bands["low"] == [30.0, 60.0]
+    assert lane.bands["mid"] == [10.0, 40.0]
+    assert lane.bands["high"] == [20.0, 50.0]
+    assert lane.heights[-1] == 1.0
 
 
 def test_downsample_waveform_uses_max_height_from_each_stable_bucket():

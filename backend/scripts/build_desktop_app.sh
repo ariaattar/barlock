@@ -11,9 +11,11 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.bun/bin:$HOME
 cd "$DESKTOP_DIR"
 ./node_modules/.bin/tauri build --ci --ignore-version-mismatches --bundles app "$@"
 
-APP_PATH="$DESKTOP_DIR/src-tauri/target/release/bundle/macos/SoundCloud DL.app"
+PRODUCT_NAME="$(bun -e 'console.log(require("./src-tauri/tauri.conf.json").productName)')"
+APP_VERSION="$(bun -e 'console.log(require("./src-tauri/tauri.conf.json").version)')"
+APP_PATH="$DESKTOP_DIR/src-tauri/target/release/bundle/macos/$PRODUCT_NAME.app"
 DMG_DIR="$DESKTOP_DIR/src-tauri/target/release/bundle/dmg"
-DMG_PATH="$DMG_DIR/SoundCloud DL_0.1.0_aarch64.dmg"
+DMG_PATH="$DMG_DIR/${PRODUCT_NAME}_${APP_VERSION}_$(uname -m).dmg"
 
 if [[ -z "${APPLE_SIGNING_IDENTITY:-}" ]]; then
   codesign --force --deep --sign - "$APP_PATH"
@@ -26,7 +28,7 @@ cp -R "$APP_PATH" "$STAGE_DIR/"
 ln -s /Applications "$STAGE_DIR/Applications"
 mkdir -p "$DMG_DIR"
 hdiutil create \
-  -volname "SoundCloud DL" \
+  -volname "$PRODUCT_NAME" \
   -srcfolder "$STAGE_DIR" \
   -ov \
   -format UDZO \

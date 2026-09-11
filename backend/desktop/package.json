@@ -1,5 +1,5 @@
 {
-  "name": "soundcloud-dl-desktop",
+  "name": "crate-desktop",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -16,10 +16,12 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-dialog": "^2.6.0",
     "geist": "^1.7.2",
     "lucide-react": "^1.34.0",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "wavesurfer.js": "^7.12.1"
   },
   "devDependencies": {
     "@playwright/test": "^1.62.1",

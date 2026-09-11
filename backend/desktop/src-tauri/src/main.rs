@@ -1,3 +1,3 @@
 fn main() {
-    soundcloud_dl_desktop_lib::run()
+    crate_desktop_lib::run()
 }

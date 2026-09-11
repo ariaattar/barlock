@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import subprocess
 import sys
 import threading
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+from .klickaud_downloader import download_mp3 as download_klickaud_mp3
 
 DEFAULT_WORKERS = min(8, max(2, os.cpu_count() or 4))
 DEFAULT_FRAGMENTS = 8
@@ -28,6 +32,7 @@ class DownloadEntry:
     url: str
     id: str | None = None
     title: str | None = None
+    artist: str | None = None
 
     @property
     def label(self) -> str:
@@ -40,6 +45,10 @@ class DownloadResult:
     ok: bool
     output_paths: tuple[Path, ...] = ()
     error: str | None = None
+    reason: str | None = None
+    download_method: str = "yt-dlp"
+    fallback_attempted: bool = False
+    primary_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,7 +111,9 @@ def resolve_ffmpeg_location(explicit: str | None = None) -> str:
     return str(ffmpeg)
 
 
-def collect_download_plan(urls: Sequence[str], *, verbose: bool = False) -> DownloadPlan:
+def collect_download_plan(
+    urls: Sequence[str], *, verbose: bool = False, status: StatusCallback | None = None,
+) -> DownloadPlan:
     if not urls:
         return DownloadPlan([])
 
@@ -113,6 +124,12 @@ def collect_download_plan(urls: Sequence[str], *, verbose: bool = False) -> Down
         "quiet": not verbose,
         "no_warnings": not verbose,
         "ignoreerrors": False,
+        "ignore_no_formats_error": True,
+        # Resolve needs titles and artists, not each track's stream manifests.
+        "extractor_args": {"soundcloud": {"formats": ["none"]}},
+        "socket_timeout": 10,
+        "extractor_retries": 0,
+        "retries": 0,
         "logger": _YtdlpLogger(verbose),
     }
 
@@ -137,6 +154,27 @@ def collect_download_plan(urls: Sequence[str], *, verbose: bool = False) -> Down
             continue
         seen.add(key)
         deduped.append(entry)
+
+    missing = [(index, entry) for index, entry in enumerate(deduped) if not entry.title or entry.title == entry.id]
+    if missing:
+        def resolve_entry(entry: DownloadEntry) -> DownloadEntry:
+            try:
+                # YoutubeDL instances are not shared between worker threads.
+                with ydl_cls(opts) as metadata_ydl:
+                    metadata = metadata_ydl.extract_info(entry.url, download=False) or {}
+                return replace(entry, title=_pick_str(metadata, "title") or entry.title,
+                               artist=_metadata_artist(metadata) or entry.artist)
+            except Exception:
+                return entry
+
+        if status:
+            status(f"Reading track details: 0/{len(missing)}")
+        with ThreadPoolExecutor(max_workers=min(4, len(missing))) as executor:
+            futures = {executor.submit(resolve_entry, entry): index for index, entry in missing}
+            for completed, future in enumerate(as_completed(futures), start=1):
+                deduped[futures[future]] = future.result()
+                if status:
+                    status(f"Reading track details: {completed}/{len(missing)}")
 
     title = collection_titles[0] if len(set(collection_titles)) == 1 else ""
     return DownloadPlan(entries=deduped, title=title)
@@ -170,6 +208,9 @@ def download_entries(
     ffmpeg_location = resolve_ffmpeg_location(ffmpeg)
     worker_count = min(workers, len(entries))
 
+    if archive:
+        _retry_missing_archived_entries(archive, output_dir, entries)
+
     lock = threading.Lock()
 
     def emit(message: str) -> None:
@@ -179,7 +220,7 @@ def download_entries(
             status(message)
 
     def run_one(index: int, entry: DownloadEntry) -> DownloadResult:
-        emit(f"[{index}/{len(entries)}] downloading {entry.label}")
+        emit(f"[{index}/{len(entries)}] downloading {entry.url}")
         try:
             result = _download_one(
                 entry,
@@ -191,8 +232,45 @@ def download_entries(
                 verbose=verbose,
             )
         except Exception as exc:  # yt-dlp raises several extractor-specific errors.
-            return DownloadResult(entry=entry, ok=False, error=str(exc))
+            primary_error = str(exc)
+            emit(f"[{index}/{len(entries)}] trying KlickAud fallback for {entry.url}")
+            try:
+                fallback_path = download_klickaud_mp3(
+                    entry.url,
+                    _klickaud_destination(output_dir, entry),
+                    status=lambda message: emit(
+                        f"[{index}/{len(entries)}] KlickAud: {message} for {entry.url}"
+                    ),
+                )
+                _write_download_metadata(fallback_path, entry)
+                if archive and entry.id:
+                    with lock:
+                        _record_download_archive(archive, entry.id)
+                result = DownloadResult(
+                    entry=entry,
+                    ok=True,
+                    output_paths=(fallback_path,),
+                    download_method="klickaud",
+                    fallback_attempted=True,
+                    primary_error=primary_error,
+                )
+                emit(f"[{index}/{len(entries)}] KlickAud fallback succeeded for {entry.url}")
+            except Exception as fallback_exc:
+                return DownloadResult(
+                    entry=entry,
+                    ok=False,
+                    error=(
+                        f"yt-dlp: {primary_error}; "
+                        f"KlickAud fallback: {fallback_exc}"
+                    ),
+                    reason=download_failure_reason(primary_error),
+                    download_method="none",
+                    fallback_attempted=True,
+                    primary_error=primary_error,
+                )
 
+        if result.download_method == "yt-dlp":
+            emit(f"[{index}/{len(entries)}] primary download succeeded for {entry.url}")
         if result.output_paths:
             files = ", ".join(path.name for path in result.output_paths)
             emit(f"[{index}/{len(entries)}] saved {files}")
@@ -210,6 +288,29 @@ def download_entries(
             results[futures[future]] = future.result()
 
     return [result for result in results if result is not None]
+
+
+def _retry_missing_archived_entries(
+    archive: Path, output_dir: Path, entries: Sequence[DownloadEntry],
+) -> None:
+    archive = archive.expanduser()
+    if not archive.is_file():
+        return
+    missing = {
+        f"soundcloud {entry.id}" for entry in entries
+        if entry.id and not _mp3_paths_for_entry(output_dir, entry)
+    }
+    original = archive.read_text()
+    retained = [line for line in original.splitlines(keepends=True) if line.strip() not in missing]
+    updated = "".join(retained)
+    if updated == original:
+        return
+    temporary = archive.with_name(f".{archive.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(updated)
+        os.replace(temporary, archive)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _download_one(
@@ -238,6 +339,103 @@ def _download_one(
         ok=True,
         output_paths=tuple(_mp3_paths_for_entry(output_dir, entry)),
     )
+
+
+def download_failure_reason(error: str) -> str:
+    return "protected" if "drm protected" in error.lower() else "download"
+
+
+def _write_download_metadata(path: Path, entry: DownloadEntry) -> None:
+    from mutagen.easyid3 import EasyID3
+    from mutagen.id3 import ID3NoHeaderError
+
+    try:
+        tags = EasyID3(path)
+    except ID3NoHeaderError:
+        tags = EasyID3()
+    if entry.title and entry.title != entry.id:
+        tags["title"] = entry.title
+    if entry.artist:
+        tags["artist"] = entry.artist
+    tags.save(path)
+
+
+def _klickaud_destination(output_dir: Path, entry: DownloadEntry) -> Path:
+    title = entry.title or urlparse(entry.url).path.rstrip("/").rsplit("/", 1)[-1]
+    safe_title = re.sub(r"[\x00-\x1f/:\\]+", "-", title).strip(" .-")[:180]
+    safe_title = safe_title or "SoundCloud track"
+    suffix = f" [{entry.id}]" if entry.id else ""
+    return output_dir / f"{safe_title}{suffix}.mp3"
+
+
+def _record_download_archive(archive: Path, track_id: str) -> None:
+    archive = archive.expanduser()
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    archive_line = f"soundcloud {track_id}"
+    existing = set(archive.read_text().splitlines()) if archive.exists() else set()
+    if archive_line not in existing:
+        with archive.open("a", encoding="utf-8") as file:
+            file.write(archive_line + "\n")
+
+
+def import_local_replacement(
+    source: Path,
+    *,
+    output_dir: Path,
+    track_id: str,
+    title: str,
+    ffmpeg: str | None = None,
+) -> Path:
+    """Copy or convert a user-supplied licensed file into the managed folder."""
+    source = source.expanduser().resolve()
+    if not source.is_file():
+        raise SoundCloudDownloadError(f"replacement audio file not found: {source}")
+    if source.suffix.lower() not in {".mp3", ".wav", ".aiff", ".aif", ".flac", ".m4a", ".aac", ".ogg", ".opus"}:
+        raise SoundCloudDownloadError(f"unsupported replacement audio type: {source.suffix or 'none'}")
+    if not re.fullmatch(r"\d+", track_id):
+        raise ValueError("a numeric SoundCloud track ID is required")
+
+    output_dir = output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_title = re.sub(r"[\x00-\x1f/:\\]+", "-", title).strip(" .-")[:180] or "SoundCloud track"
+    destination = output_dir / f"{safe_title} [{track_id}].mp3"
+    if source == destination:
+        return destination
+
+    temporary = destination.with_name(f".{destination.stem}.{os.getpid()}.tmp.mp3")
+    try:
+        if source.suffix.lower() == ".mp3":
+            shutil.copy2(source, temporary)
+        else:
+            completed = subprocess.run(
+                [
+                    resolve_ffmpeg_location(ffmpeg),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(source),
+                    "-vn",
+                    "-map_metadata",
+                    "0",
+                    "-codec:a",
+                    "libmp3lame",
+                    "-b:a",
+                    "320k",
+                    str(temporary),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = completed.stderr.strip().splitlines()[-1:] or ["conversion failed"]
+                raise SoundCloudDownloadError(detail[0])
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
 
 
 def _download_options(
@@ -279,6 +477,13 @@ def _download_options(
     return opts
 
 
+def _metadata_artist(info: dict[str, Any]) -> str | None:
+    artists = info.get("artists")
+    if isinstance(artists, list) and artists:
+        return ", ".join(str(artist) for artist in artists)
+    return _pick_str(info, "artist") or _pick_str(info, "uploader")
+
+
 def _flatten_info(info: dict[str, Any] | None) -> list[DownloadEntry]:
     if not info:
         return []
@@ -296,6 +501,7 @@ def _flatten_info(info: dict[str, Any] | None) -> list[DownloadEntry]:
             url=url,
             id=_pick_str(info, "id"),
             title=_pick_str(info, "title"),
+            artist=_metadata_artist(info),
         )
     ]
 
@@ -359,7 +565,7 @@ def _mp3_paths_for_entry(output_dir: Path, entry: DownloadEntry) -> list[Path]:
     if not entry.id:
         return []
     suffix = f"[{entry.id}].mp3"
-    return sorted(path for path in output_dir.glob("*.mp3") if path.name.endswith(suffix))
+    return sorted(path for path in output_dir.glob("*.mp3") if path.is_file() and path.name.endswith(suffix))
 
 
 def _youtube_dl_cls():

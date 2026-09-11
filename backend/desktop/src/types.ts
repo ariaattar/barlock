@@ -21,6 +21,7 @@ export interface SourceEntry {
   url: string
   title: string
   label: string
+  artist?: string
 }
 
 export interface SyncPlan {
@@ -56,9 +57,15 @@ export interface PlaylistTrack {
 }
 
 export interface RekordboxWaveformLane {
-  tag: "PWAV" | "PWV3" | "PWV4" | "PWV5" | string
+  tag: "PWAV" | "PWV3" | "PWV4" | "PWV5" | "PWV6" | "PWV7" | string
   heights: number[]
   colors: number[][]
+  style?: "blue" | "rgb" | "three_band" | string
+  sample_rate_hz?: number | null
+  source_points?: number
+  bands?: { low?: number[]; mid?: number[]; high?: number[] }
+  back_heights?: number[]
+  back_colors?: number[][]
 }
 
 export interface RekordboxBeat {
@@ -94,6 +101,7 @@ export interface RekordboxWaveform {
 
 export interface TrackFeature {
   path: string
+  source_id?: string
   title: string
   artist: string
   duration_sec: number
@@ -104,10 +112,87 @@ export interface TrackFeature {
   energy: number
   energy_curve?: number[]
   segmentation_mode?: string
+  first_downbeat_sec?: number
+}
+
+export type EditorMarkerRole = "intro" | "phrase16" | "phrase32" | "intro_loop" | "exit_loop"
+
+export interface EditorMarker {
+  role: EditorMarkerRole
+  pad: string
+  name: string
+  kind: "hot" | "loop" | "memory"
+  hotcue_slot: number | null
+  seconds: number
+  end_seconds: number | null
+  loop_beats: 4 | 8 | null
+  snap_mode: "downbeat" | "beat"
+  ownership: "suggested" | "app"
+  source_cue_id: string
+  conflict: boolean
+}
+
+export interface EditorCorrections {
+  bpm: number
+  first_downbeat_sec: number
+  camelot_key: string
+  musical_key: string
+  write_grid: boolean
+  markers: EditorMarker[]
+  grid: RekordboxBeat[]
+}
+
+export interface EditorCuePoint extends RekordboxCuePoint {
+  role: EditorMarkerRole | ""
+  ownership: "app" | "legacy_candidate" | "manual"
+  locked: boolean
+}
+
+export interface EditorState {
+  schema_version: number
+  track: {
+    content_id: string
+    path: string
+    title: string
+    artist: string
+    duration_sec: number
+    sample_rate: number
+    managed: boolean
+    audio_fingerprint: string
+  }
+  waveform: RekordboxWaveform & { source: "rekordbox_anlz" | "local_analysis" }
+  existing_cues: EditorCuePoint[]
+  draft: {
+    id: string
+    revision: number
+    status: "draft" | "applied" | "stale"
+    updated_at: string
+    corrections: EditorCorrections
+  }
+  grid_editable: boolean
+  can_apply_rekordbox: boolean
+  warnings: string[]
+}
+
+export interface EditorApplyPreview {
+  draft_id: string
+  revision: number
+  rekordbox: boolean
+  rekordbox_running: boolean
+  conflicts: string[]
+  changes: string[]
+}
+
+export interface EditorAudition {
+  path: string
+  context_start_sec: number
+  loop_start_sec: number
+  loop_end_sec: number
+  duration_sec: number
 }
 
 export interface BridgeMessage {
-  event?: "status" | "plan" | "done" | "error"
+  event?: "status" | "plan" | "done" | "error" | "download-results"
   message?: string
   ok?: boolean
   [key: string]: unknown
@@ -123,12 +208,17 @@ export interface JobTrack {
   id: string
   title: string
   artist: string
-  stage: "queued" | "downloading" | "converting" | "analyzing" | "syncing" | "ready" | "failed" | "skipped"
+  stage: "queued" | "downloading" | "fallback" | "converting" | "analyzing" | "syncing" | "ready" | "resolved" | "protected" | "failed" | "skipped" | "interrupted"
   progress: number
   bpm?: number
   key?: string
+  path?: string
+  sourceUrl?: string
   cueStatus: "off" | "proposed" | "filled" | "skipped"
   error?: string
+  downloadMethod?: "yt-dlp" | "klickaud"
+  fallbackAttempted?: boolean
+  primaryDownloadError?: string
 }
 
 export interface ActivityJob {

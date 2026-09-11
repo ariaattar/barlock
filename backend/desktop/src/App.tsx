@@ -1,3 +1,7 @@
+import { AppButton, StatusBadge, Segmented } from "./components/Primitives"
+import { Sidebar, Topbar } from "./components/AppChrome"
+import { CommandPalette } from "./components/CommandPalette"
+import { useDialogFocus } from "./components/useDialogFocus"
 import {
   Activity,
   AlertCircle,
@@ -9,28 +13,26 @@ import {
   ChevronDown,
   CircleDot,
   Clock3,
-  Command,
   Disc3,
   Download,
   ExternalLink,
   FileAudio,
+  FileUp,
   Folder,
   Gauge,
   HardDrive,
   Heart,
   Info,
   ListMusic,
+  LockKeyhole,
   LoaderCircle,
-  MoreHorizontal,
   Music2,
-  PanelRightClose,
-  PanelRightOpen,
   Plus,
   RefreshCw,
   RotateCcw,
   Search,
-  Settings,
   ShieldCheck,
+  SlidersHorizontal,
   Square,
   Trash2,
   TriangleAlert,
@@ -41,8 +43,10 @@ import {
   type LucideIcon,
 } from "lucide-react"
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { finalMessage, isDesktopRuntime, runBridge } from "./lib/bridge"
+import { finalMessage, isDesktopRuntime, runBridge, selectReplacementAudio } from "./lib/bridge"
 import { mockConfig } from "./lib/mock"
+import { drawRekordboxBeatGrid, drawRekordboxWaveform, waveformFormatLabel } from "./lib/rekordboxWaveform"
+import { TrackEditor, type EditorTarget } from "./TrackEditor"
 import type {
   ActivityJob,
   AppConfig,
@@ -72,12 +76,6 @@ type InspectorItem =
   | { kind: "rekordbox-track"; track: PlaylistTrack; playlist: Playlist }
   | null
 
-interface NavItem {
-  id: ViewId
-  label: string
-  icon: LucideIcon
-  badge?: number
-}
 
 function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback
@@ -91,16 +89,48 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? value as Record<string, unknown> : {}
 }
 
+function stopActiveTracks(tracks: JobTrack[], message: string): JobTrack[] {
+  return tracks.map((track) => ["queued", "downloading", "fallback", "converting", "analyzing", "syncing"].includes(track.stage)
+    ? { ...track, stage: "interrupted", error: message }
+    : track)
+}
+
 function loadStoredJobs(): ActivityJob[] {
   try {
     const value = JSON.parse(localStorage.getItem(JOBS_KEY) ?? "[]")
     if (!Array.isArray(value)) return []
-    return value.map((job: ActivityJob) => job.state === "running" ? {
-      ...job,
-      state: "failed",
-      stage: "Interrupted",
-      summary: "The app closed before this job finished. Resolve the source again to retry its remaining delta.",
-    } : job)
+    return value.map((stored: ActivityJob) => {
+      let job = stored
+      if (job.state === "running") {
+        job = {
+          ...job,
+          state: "failed",
+          stage: "Interrupted",
+          summary: "The app closed before this job finished. Resolve the source again to retry its remaining delta.",
+        }
+      }
+      if (job.state === "failed") {
+        const interrupted = job.tracks.some((track) => ["analyzing", "syncing"].includes(track.stage))
+        const message = interrupted
+          ? "The worker stopped before analysis/import finished. Retry sync reuses audio already saved on disk."
+          : job.summary || "The worker stopped. Retry sync to continue."
+        job = { ...job, tracks: stopActiveTracks(job.tracks, message), summary: interrupted ? message : job.summary }
+      }
+      const tracks = job.tracks.map((track) => track.stage === "failed" && track.error?.toLowerCase().includes("drm protected") ? {
+        ...track,
+        stage: "protected" as const,
+        cueStatus: "skipped" as const,
+        error: "SoundCloud restricts this track to encrypted playback. Attach a licensed audio file to continue.",
+      } : track)
+      const protectedCount = tracks.filter((track) => track.stage === "protected").length
+      return protectedCount ? {
+        ...job,
+        state: job.state === "complete" ? "partial" : job.state,
+        stage: job.state === "running" || job.state === "blocked" ? job.stage : "Needs source files",
+        summary: `${protectedCount} protected track(s) need a licensed local audio file.`,
+        tracks,
+      } : { ...job, tracks }
+    })
   } catch {
     return []
   }
@@ -132,158 +162,6 @@ function formatTimestamp(seconds: number): string {
   return `${minutes}:${remainder.toFixed(3).padStart(6, "0")}`
 }
 
-function AppButton({
-  children,
-  icon: Icon,
-  tone = "secondary",
-  size = "default",
-  loading = false,
-  ...props
-}: {
-  children?: ReactNode
-  icon?: LucideIcon
-  tone?: "primary" | "secondary" | "ghost" | "danger"
-  size?: "default" | "small" | "icon"
-  loading?: boolean
-} & React.ButtonHTMLAttributes<HTMLButtonElement>) {
-  const CurrentIcon = loading ? LoaderCircle : Icon
-  return (
-    <button className={`button button-${tone} button-${size}`} {...props} disabled={props.disabled || loading}>
-      {CurrentIcon ? <CurrentIcon size={size === "small" ? 14 : 16} className={loading ? "spin" : ""} aria-hidden="true" /> : null}
-      {children ? <span>{children}</span> : null}
-    </button>
-  )
-}
-
-function StatusBadge({ tone, children }: { tone: "neutral" | "success" | "warning" | "danger" | "blue"; children: ReactNode }) {
-  return <span className={`status-badge status-${tone}`}><span className="status-dot" />{children}</span>
-}
-
-function AppLogo() {
-  return (
-    <div className="brand-lockup">
-      <div className="brand-mark" aria-hidden="true">
-        <span />
-        <span />
-        <span />
-        <span />
-        <span />
-      </div>
-      <div>
-        <strong>SoundCloud DL</strong>
-        <span>Rekordbox prep</span>
-      </div>
-    </div>
-  )
-}
-
-function Sidebar({ active, onChange, onLikes, jobs, config }: { active: ViewId; onChange: (id: ViewId) => void; onLikes: () => void; jobs: ActivityJob[]; config: AppConfig | null }) {
-  const activeJobs = jobs.filter((job) => job.state === "running" || job.state === "blocked").length
-  const nav: NavItem[] = [
-    { id: "import", label: "New import", icon: Plus },
-    { id: "activity", label: "Activity", icon: Activity, badge: activeJobs || undefined },
-    { id: "downloads", label: "Downloads", icon: Download },
-    { id: "rekordbox", label: "Rekordbox", icon: Disc3 },
-    { id: "doctor", label: "Doctor", icon: ShieldCheck },
-  ]
-  return (
-    <aside className="sidebar">
-      <div className="sidebar-drag" data-tauri-drag-region />
-      <AppLogo />
-      <nav className="sidebar-nav" aria-label="Primary">
-        <div className="nav-section-label">Workspace</div>
-        {nav.map((item) => {
-          const Icon = item.icon
-          return (
-            <button key={item.id} className={`nav-item ${active === item.id ? "active" : ""}`} onClick={() => onChange(item.id)}>
-              <Icon size={16} aria-hidden="true" />
-              <span>{item.label}</span>
-              {item.badge ? <span className="nav-badge">{item.badge}</span> : null}
-            </button>
-          )
-        })}
-      </nav>
-      <div className="sidebar-spacer" />
-      {config?.likes_url ? (
-        <button className="saved-source" onClick={onLikes}>
-          <span className="saved-source-icon"><Heart size={14} /></span>
-          <span><strong>@{config.soundcloud_username}</strong><small>Likes source</small></span>
-        </button>
-      ) : null}
-      <button className={`nav-item settings-link ${active === "settings" ? "active" : ""}`} onClick={() => onChange("settings")}>
-        <Settings size={16} aria-hidden="true" />
-        <span>Settings</span>
-      </button>
-      <div className="user-block">
-        <div className="user-avatar">AA</div>
-        <div><strong>Local library</strong><span>{isDesktopRuntime ? "Desktop engine" : "Preview mode"}</span></div>
-        <MoreHorizontal size={16} />
-      </div>
-    </aside>
-  )
-}
-
-function Topbar({
-  view,
-  inspectorOpen,
-  onToggleInspector,
-  onOpenPalette,
-  rekordboxRunning,
-}: {
-  view: ViewId
-  inspectorOpen: boolean
-  onToggleInspector: () => void
-  onOpenPalette: () => void
-  rekordboxRunning: boolean | null
-}) {
-  const titles: Record<ViewId, { title: string; description: string }> = {
-    import: { title: "New import", description: "SoundCloud to Rekordbox" },
-    activity: { title: "Activity", description: "Jobs and exceptions" },
-    downloads: { title: "Downloads", description: "Local prepared tracks" },
-    rekordbox: { title: "Rekordbox", description: "Playlists and cue safety" },
-    doctor: { title: "Doctor", description: "Diagnostics and repairs" },
-    settings: { title: "Settings", description: "Storage and defaults" },
-  }
-  const current = titles[view]
-  return (
-    <header className="topbar" data-tauri-drag-region>
-      <div className="window-controls-space" data-tauri-drag-region />
-      <button className="icon-button subtle" aria-label="Back" disabled><ArrowLeft size={16} /></button>
-      <div className="view-heading" data-tauri-drag-region>
-        <strong>{current.title}</strong>
-        <span>{current.description}</span>
-      </div>
-      <div className="topbar-spacer" data-tauri-drag-region />
-      <button className="command-trigger" onClick={onOpenPalette}>
-        <Search size={14} />
-        <span>Search or run a command</span>
-        <kbd><Command size={11} />K</kbd>
-      </button>
-      <StatusBadge tone={rekordboxRunning ? "warning" : rekordboxRunning === false ? "success" : "neutral"}>
-        Rekordbox {rekordboxRunning ? "open" : rekordboxRunning === false ? "closed" : "checking"}
-      </StatusBadge>
-      <button className="icon-button" onClick={onToggleInspector} aria-label={inspectorOpen ? "Close inspector" : "Open inspector"} title={inspectorOpen ? "Close inspector" : "Open inspector"}>
-        {inspectorOpen ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
-      </button>
-    </header>
-  )
-}
-
-function Segmented<T extends string>({ value, onChange, options }: { value: T; onChange: (value: T) => void; options: { value: T; label: string; icon?: LucideIcon }[] }) {
-  return (
-    <div className="segmented">
-      {options.map((option) => {
-        const Icon = option.icon
-        return (
-          <button key={option.value} className={value === option.value ? "active" : ""} onClick={() => onChange(option.value)}>
-            {Icon ? <Icon size={14} /> : null}{option.label}
-          </button>
-        )
-      })}
-    </div>
-  )
-}
-
 function SourceIcon({ url }: { url: string }) {
   return (
     <div className="source-art" aria-hidden="true">
@@ -301,7 +179,7 @@ function PlanSummary({ plan }: { plan: SyncPlan }) {
       <div><strong>{plan.total_count}</strong><span>Total tracks</span></div>
       <div className="plan-new"><strong>+{newCount}</strong><span>New downloads</span></div>
       <div><strong>{plan.unchanged_count}</strong><span>Already local</span></div>
-      <div className={plan.removed_ids.length ? "plan-warning" : ""}><strong>{plan.removed_ids.length}</strong><span>Removed upstream</span></div>
+      <div className={plan.removed_ids.length ? "plan-warning" : ""}><strong>{plan.removed_ids.length}</strong><span>Missing upstream · kept</span></div>
     </div>
   )
 }
@@ -315,8 +193,8 @@ function SourceTrackList({ entries }: { entries: SourceEntry[] }) {
       {visible.map((entry, index) => (
         <div className="source-track-row" key={entry.id || entry.url}>
           <span className="track-index">{String(index + 1).padStart(2, "0")}</span>
-          <span className="track-mini-wave"><i /><i /><i /><i /><i /><i /><i /><i /></span>
-          <span className="source-track-title">{entry.title || entry.label}</span>
+          <FileAudio size={16} className="muted" aria-hidden="true" />
+          <span className="source-track-title"><strong>{entry.title || entry.label}</strong>{entry.artist ? <small>{entry.artist}</small> : null}</span>
           <StatusBadge tone="blue">New</StatusBadge>
         </div>
       ))}
@@ -384,11 +262,12 @@ function ImportWorkspace({
     setAnalyze(resumeJob.analyze ?? true)
     setCueMode(resumeJob.cueMode ?? "off")
     setRunningJobId(resumeJob.id)
-    setHandoffBusy(true)
-    setEngineStatus("Refreshing source delta...")
+    setHandoffBusy(resumeJob.state !== "complete")
+    setEngineStatus(resumeJob.state === "complete" ? "" : "Refreshing source delta...")
     setError("")
 
     const rehydrate = async () => {
+      if (resumeJob.state === "complete") { onResumeJobConsumed(); return }
       try {
         const result = await runBridge("sync-plan", [resumeJob.sourceUrl], undefined, (message) => {
           if (!canceled && message.message) setEngineStatus(message.message)
@@ -441,6 +320,26 @@ function ImportWorkspace({
   }
 
   const applyProgressMessage = (jobId: string, message: BridgeMessage, entries: SourceEntry[]) => {
+    if (message.event === "download-results" && Array.isArray(message.download_outcomes)) {
+      const outcomes = message.download_outcomes.map(asRecord)
+      onUpdateJob(jobId, (job) => ({
+        tracks: job.tracks.map((track) => {
+          const outcome = outcomes.find((item) => asString(item.id) === track.id)
+          if (!outcome) return track
+          const failed = outcome.outcome === "failed"
+          return {
+            ...track,
+            stage: failed ? "failed" : analyze ? "analyzing" : "ready",
+            progress: failed || !analyze ? 100 : 58,
+            path: Array.isArray(outcome.paths) ? asString(outcome.paths[0]) : track.path,
+            downloadMethod: outcome.download_method === "klickaud" ? "klickaud" : outcome.download_method === "yt-dlp" ? "yt-dlp" : undefined,
+            fallbackAttempted: outcome.fallback_attempted === true,
+            primaryDownloadError: asString(outcome.primary_error),
+            error: failed ? asString(outcome.error) : undefined,
+          }
+        }),
+      }))
+    }
     if (message.event === "status" && message.message) {
       setEngineStatus(message.message)
       const value = message.message
@@ -449,7 +348,13 @@ function ImportWorkspace({
         let stage = job.stage
         let progress = job.progress
         const urlMatch = value.match(/(?:downloading|finished) (https?:\/\/\S+)$/)
-        const analysisMatch = value.match(/analyzing (.+)$/i)
+        const statusUrlMatch = value.match(/(https?:\/\/\S+)$/)
+        const analysisProgressMatch = value.match(/\[(\d+)\/(\d+) done\]/i)
+        const analyzedFileMatch = value.match(/analyzing \((.+)\)$/i)
+        const lowerValue = value.toLowerCase()
+        const statusEntryIndex = statusUrlMatch
+          ? entries.findIndex((entry) => entry.url === statusUrlMatch[1])
+          : -1
         if (value.includes("downloading")) stage = "Downloading"
         if (value.includes("finished") && urlMatch) {
           const index = entries.findIndex((entry) => entry.url === urlMatch[1])
@@ -465,14 +370,36 @@ function ImportWorkspace({
             tracks[index].progress = 24
           }
         }
-        if (value.toLowerCase().includes("analyzing")) {
+        if ((lowerValue.includes("trying klickaud fallback") || lowerValue.includes("klickaud:")) && statusEntryIndex >= 0 && tracks[statusEntryIndex]) {
+          stage = "Trying KlickAud fallback"
+          tracks[statusEntryIndex].stage = "fallback"
+          tracks[statusEntryIndex].progress = Math.max(tracks[statusEntryIndex].progress, 36)
+          tracks[statusEntryIndex].fallbackAttempted = true
+        }
+        if (lowerValue.includes("klickaud fallback succeeded") && statusEntryIndex >= 0 && tracks[statusEntryIndex]) {
+          stage = "Fallback recovered"
+          tracks[statusEntryIndex].stage = analyze ? "analyzing" : "ready"
+          tracks[statusEntryIndex].progress = analyze ? 58 : 100
+          tracks[statusEntryIndex].downloadMethod = "klickaud"
+          tracks[statusEntryIndex].fallbackAttempted = true
+        }
+        if (lowerValue.includes("primary download succeeded") && statusEntryIndex >= 0 && tracks[statusEntryIndex]) {
+          tracks[statusEntryIndex].stage = analyze ? "analyzing" : "ready"
+          tracks[statusEntryIndex].progress = analyze ? 58 : 100
+          tracks[statusEntryIndex].downloadMethod = "yt-dlp"
+        }
+        if (lowerValue.includes("analyzing")) {
           stage = "Analyzing"
-          progress = Math.max(progress, 58)
-          if (analysisMatch) {
-            const index = tracks.findIndex((track) => analysisMatch[1].includes(track.title))
+          const analyzedCount = analysisProgressMatch ? Number(analysisProgressMatch[1]) : 0
+          const analysisTotal = analysisProgressMatch ? Number(analysisProgressMatch[2]) : 0
+          const analysisRatio = analysisTotal > 0 ? analyzedCount / analysisTotal : 0
+          progress = Math.max(progress, 58 + analysisRatio * 28)
+          if (analyzedFileMatch) {
+            const filename = analyzedFileMatch[1]
+            const index = tracks.findIndex((track) => filename.includes(`[${track.id}]`) || filename.includes(track.title))
             if (index >= 0) {
               tracks[index].stage = "analyzing"
-              tracks[index].progress = 76
+              tracks[index].progress = 86
             }
           }
         }
@@ -485,6 +412,20 @@ function ImportWorkspace({
   const runImport = async (jobId: string, activePlan: SyncPlan) => {
     setError("")
     setEngineStatus("Preparing import...")
+    onUpdateJob(jobId, (job) => {
+      const knownIds = new Set(job.tracks.map((track) => track.id))
+      const added: JobTrack[] = activePlan.added.filter((entry) => !knownIds.has(entry.id)).map((entry) => ({
+        id: entry.id,
+        title: entry.title || entry.label,
+        artist: entry.artist || "SoundCloud",
+        stage: "queued",
+        progress: 0,
+        cueStatus: cueMode === "fill" ? "proposed" : "off",
+        sourceUrl: entry.url,
+      }))
+      const tracks = [...job.tracks, ...added]
+      return { tracks, total: Math.max(tracks.length, 1) }
+    })
     try {
       const result = await runBridge("sync", [], {
         url: activePlan.url,
@@ -498,43 +439,101 @@ function ImportWorkspace({
       const done = finalMessage(result)
       const failedRaw = Array.isArray(done.failed_downloads) ? done.failed_downloads : Array.isArray(done.failures) ? done.failures : []
       const failed = failedRaw.map(asRecord)
+      const outcomeRaw = Array.isArray(done.download_outcomes) ? done.download_outcomes : []
+      const outcomes = outcomeRaw.map(asRecord)
       const featureRaw = Array.isArray(done.features) ? done.features : []
       const features = featureRaw.map((value) => asRecord(value) as unknown as TrackFeature)
+      const completedPaths = Array.isArray(done.paths) ? done.paths.map((value) => asString(value)) : []
+      const protectedIds = new Set(Array.isArray(done.protected_ids) ? done.protected_ids.map((value) => asString(value)) : [])
+      const exceptionIds = new Set([
+        ...failed.map((item) => asString(item.id)).filter(Boolean),
+        ...protectedIds,
+      ])
+      const jobTracks = jobs.find((job) => job.id === jobId)?.tracks
+      const relevantTrackIds = [...new Set([
+        ...(jobTracks?.map((track) => track.id) ?? []),
+        ...activePlan.added.map((entry) => entry.id),
+      ])]
+      const exceptionCount = relevantTrackIds.reduce((count, id) => count + (exceptionIds.has(id) ? 1 : 0), 0)
+      const fallbackCount = outcomes.filter((item) => asString(item.outcome) === "fallback_succeeded").length
+      const terminalFailureCount = failed.filter((item) => asString(item.reason) !== "protected").length
+      const protectedFailureCount = Math.max(exceptionCount - terminalFailureCount, 0)
+      const recoverySuffix = fallbackCount
+        ? ` · ${fallbackCount} recovered with KlickAud`
+        : ""
+      const completionSummary = destination === "rekordbox"
+        ? `${asNumber(asRecord(done.push).added_to_playlist, activePlan.added.length)} added to ${playlistName}${recoverySuffix}`
+        : `${activePlan.added.length} downloaded to ${outputDir}${recoverySuffix}`
+      const failureSummary = [
+        terminalFailureCount
+          ? `${terminalFailureCount} failed after both download methods.`
+          : "",
+        protectedFailureCount
+          ? `${protectedFailureCount} protected track(s) need a licensed local audio file.`
+          : "",
+        fallbackCount
+          ? `${fallbackCount} other track(s) were recovered with KlickAud.`
+          : "",
+      ].filter(Boolean).join(" ")
       onUpdateJob(jobId, (existing) => ({
-        state: failed.length ? "partial" : "complete",
-        stage: failed.length ? "Complete with exceptions" : "Complete",
+        state: exceptionCount ? "partial" : "complete",
+        stage: exceptionCount
+          ? terminalFailureCount ? "Download failures" : "Needs source files"
+          : "Complete",
         progress: 100,
-        completed: Math.max(existing.total - failed.length, 0),
-        summary: destination === "rekordbox"
-          ? `${asNumber(asRecord(done.push).added_to_playlist, activePlan.added.length)} added to ${playlistName}`
-          : `${Math.max(activePlan.added.length - failed.length, 0)} downloaded to ${outputDir}`,
-        tracks: existing.tracks.map((track, index) => {
+        completed: Math.max(existing.total - exceptionCount, 0),
+        summary: exceptionCount ? failureSummary : completionSummary,
+        tracks: existing.tracks.map((track) => {
           const failure = failed.find((item) => asString(item.id) === track.id || asString(item.title) === track.title || asString(item.label) === track.title)
-          const feature = features.find((item) => item.title === track.title) ?? features[index]
-          return failure ? {
+          const outcome = outcomes.find((item) => asString(item.id) === track.id || asString(item.title) === track.title || asString(item.url) === track.sourceUrl)
+          const isProtected = protectedIds.has(track.id) || asString(failure?.reason) === "protected"
+          const usedFallback = asString(outcome?.outcome) === "fallback_succeeded" || asString(outcome?.download_method) === "klickaud"
+          const fallbackAttempted = outcome?.fallback_attempted === true || track.fallbackAttempted
+          const primaryDownloadError = asString(outcome?.primary_error) || track.primaryDownloadError
+          const feature = features.find((item) => item.source_id === track.id || item.path?.includes(`[${track.id}]`) || item.title === track.title)
+          const completedPath = completedPaths.find((path) => path.includes(`[${track.id}]`))
+          return isProtected ? {
+            ...track,
+            stage: "protected",
+            progress: 100,
+            cueStatus: "skipped",
+            error: asString(failure?.error, "SoundCloud restricts this track to encrypted playback. Attach a licensed audio file to continue."),
+            fallbackAttempted,
+            primaryDownloadError,
+          } : failure ? {
             ...track,
             stage: "failed",
             progress: 100,
             error: asString(failure.error, "Download unavailable"),
+            fallbackAttempted,
+            primaryDownloadError,
           } : {
             ...track,
             stage: "ready",
             progress: 100,
+            title: feature?.title || track.title,
+            artist: feature?.artist || track.artist,
             bpm: feature?.bpm,
             key: feature?.musical_key,
+            path: feature?.path ?? completedPath,
             cueStatus: cueMode === "fill" && destination === "rekordbox" ? "filled" : "off",
+            error: undefined,
+            downloadMethod: usedFallback ? "klickaud" : asString(outcome?.download_method) === "yt-dlp" ? "yt-dlp" : track.downloadMethod,
+            fallbackAttempted,
+            primaryDownloadError,
           }
         }),
       }))
-      setEngineStatus(failed.length ? `${failed.length} track(s) need attention` : "Import complete")
+      setEngineStatus(exceptionCount ? `${exceptionCount} track(s) need attention` : fallbackCount ? `${fallbackCount} track(s) recovered with KlickAud` : "Import complete")
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason)
       const blocked = message.toLowerCase().includes("rekordbox") && message.toLowerCase().includes("close")
-      onUpdateJob(jobId, {
+      onUpdateJob(jobId, (existing) => ({
         state: blocked ? "blocked" : "failed",
         stage: blocked ? "Waiting for Rekordbox" : "Failed",
         summary: message,
-      })
+        tracks: blocked ? existing.tracks : stopActiveTracks(existing.tracks, message),
+      }))
       setError(message)
       setEngineStatus("")
     }
@@ -548,10 +547,11 @@ function ImportWorkspace({
     const tracks: JobTrack[] = plan.added.map((entry, index) => ({
       id: entry.id || String(index),
       title: entry.title || entry.label,
-      artist: "SoundCloud",
+      artist: entry.artist || "SoundCloud",
       stage: "queued",
       progress: 0,
       cueStatus: cueMode === "fill" ? "proposed" : "off",
+      sourceUrl: entry.url,
     }))
     onCreateJob({
       id: jobId,
@@ -605,6 +605,30 @@ function ImportWorkspace({
     setError("")
   }
 
+  const retryImport = async () => {
+    if (!currentJob || !plan) return
+    setError("")
+    setHandoffBusy(true)
+    setEngineStatus("Refreshing source delta...")
+    try {
+      const refreshed = finalMessage(await runBridge("sync-plan", [currentJob.sourceUrl])) as unknown as SyncPlan
+      setPlan(refreshed)
+      onUpdateJob(currentJob.id, (job) => ({
+        state: "running",
+        stage: "Preparing",
+        summary: undefined,
+        tracks: job.tracks.map((track) => ({ ...track, error: undefined })),
+      }))
+      await runImport(currentJob.id, refreshed)
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason)
+      setError(message)
+      onUpdateJob(currentJob.id, { state: "failed", summary: message })
+    } finally {
+      setHandoffBusy(false)
+    }
+  }
+
   if (currentJob) {
     return (
       <JobWorkspace
@@ -612,6 +636,7 @@ function ImportWorkspace({
         status={engineStatus}
         onInspect={(track) => onInspect({ kind: "track", track })}
         onNewImport={reset}
+        onRetry={retryImport}
         onFinishLater={() => { reset(); onShowActivity() }}
         onCloseRekordbox={() => void resumeImport(true)}
         onCheckAgain={() => void resumeImport(false)}
@@ -621,12 +646,12 @@ function ImportWorkspace({
   }
 
   return (
-    <main className="workspace import-workspace">
-      <section className="import-intro">
-        <div className="eyebrow"><span className="live-dot" />Ready for a new source</div>
-        <h1>Bring a set into Rekordbox.</h1>
-        <p>Paste a public SoundCloud track, playlist, or likes URL. Existing downloads and playlist rows stay untouched.</p>
-        <form className={`url-command ${resolving ? "loading" : ""}`} onSubmit={resolveSource}>
+    <main className={`workspace import-workspace ${plan ? "has-plan" : ""}`}>
+      <section className="import-intro"><div className="import-art" aria-hidden="true"><div className="record-sleeve sleeve-back" /><div className="record-sleeve sleeve-front"><span>CRATE SELECTS</span><div className="vinyl-disc"><i /></div><small>READY FOR YOUR NEXT SET</small></div></div>
+        <div className="eyebrow"><span className="live-dot" />FROM DISCOVERY TO DECKS</div>
+        <h1>{plan ? "Make it yours." : "Good finds. Great sets."}</h1>
+        <p>Bring your SoundCloud finds together. Download, prepare, and send them straight to Rekordbox.</p>
+        <div className="import-source-label">Start with a SoundCloud link</div><form className={`url-command ${resolving ? "loading" : ""}`} onSubmit={resolveSource}>
           <div className="url-service"><AudioLines size={19} /></div>
           <input
             value={url}
@@ -640,7 +665,7 @@ function ImportWorkspace({
             Resolve
           </AppButton>
         </form>
-        {resolving ? <div className="resolving-line"><LoaderCircle className="spin" size={14} /><span>{engineStatus || "Reading SoundCloud source..."}</span></div> : null}
+        {resolving ? <div className="resolving-line" role="status"><LoaderCircle className="spin" size={14} /><span>{engineStatus || "Reading SoundCloud source..."}</span></div> : null}
         {error ? <InlineError message={error} onRetry={() => resolveSource()} /> : null}
       </section>
 
@@ -687,7 +712,7 @@ function ImportWorkspace({
             </div>
             <div className="config-row">
               <div className="config-label"><span className="config-icon"><WandSparkles size={15} /></span><div><strong>Analyze and tag</strong><span>BPM, alphanumeric key, energy, and metadata.</span></div></div>
-              <button className={`toggle ${analyze ? "on" : ""}`} role="switch" aria-checked={analyze} onClick={() => setAnalyze((value) => !value)}><span /></button>
+              <button className={`toggle ${analyze ? "on" : ""}`} role="switch" aria-label="Analyze and tag" aria-checked={analyze} onClick={() => setAnalyze((value) => !value)}><span /></button>
             </div>
             {destination === "rekordbox" && analyze ? (
               <div className="config-row cue-policy-row">
@@ -770,7 +795,7 @@ function RecentSources({ config, jobs, onPick }: { config: AppConfig | null; job
               <span className="recent-name"><strong>{item.title}</strong><small>{item.detail}</small></span>
               <span className="recent-time">{item.time}</span>
               <StatusBadge tone={item.state === "Review" ? "warning" : item.state.endsWith("%") ? "blue" : "neutral"}>{item.state}</StatusBadge>
-              <span className="row-arrow">-&gt;</span>
+              <ArrowRight className="row-arrow" size={15} aria-hidden="true" />
             </button>
           )
         })}
@@ -778,7 +803,7 @@ function RecentSources({ config, jobs, onPick }: { config: AppConfig | null; job
       {!items.length ? <EmptyState icon={ListMusic} title="No recent sources" description="Resolved SoundCloud sources appear here after the first import." /> : null}
       <div className="workflow-note">
         <Zap size={15} />
-        <div><strong>Delta-aware by default</strong><span>Repeat playlist runs resolve the full source but download only new track IDs.</span></div>
+        <div><strong>Your collection, kept up to date</strong><span>Come back to any source. Crate picks up new tracks and keeps the music you already have.</span></div>
       </div>
     </section>
   )
@@ -794,37 +819,63 @@ function InlineError({ message, onRetry }: { message: string; onRetry?: () => vo
   )
 }
 
-function JobWorkspace({ job, status, onInspect, onNewImport, onFinishLater, onCloseRekordbox, onCheckAgain, handoffBusy }: { job: ActivityJob; status: string; onInspect: (track: JobTrack) => void; onNewImport: () => void; onFinishLater: () => void; onCloseRekordbox: () => void; onCheckAgain: () => void; handoffBusy: boolean }) {
+function JobWorkspace({ job, status, onInspect, onNewImport, onRetry, onFinishLater, onCloseRekordbox, onCheckAgain, handoffBusy }: { job: ActivityJob; status: string; onInspect: (track: JobTrack) => void; onNewImport: () => void; onRetry: () => void; onFinishLater: () => void; onCloseRekordbox: () => void; onCheckAgain: () => void; handoffBusy: boolean }) {
   const failed = job.tracks.filter((track) => track.stage === "failed").length
-  const complete = job.state === "complete" || job.state === "partial"
+  const protectedCount = job.tracks.filter((track) => track.stage === "protected").length
+  const fallbackRecovered = job.tracks.filter((track) => track.stage === "ready" && track.downloadMethod === "klickaud").length
+  const complete = job.state === "complete"
+  const finished = complete || job.state === "partial"
+  const analysisFailed = job.state === "failed" && job.summary?.toLowerCase().includes("analysis failed")
+  const progressDetail = analysisFailed && job.progress >= 58
+    ? `${job.total} downloaded · analysis interrupted`
+    : `${job.completed} of ${job.total} tracks complete`
   return (
     <main className="workspace job-workspace">
       <section className="job-header">
-        <div className={`job-state-icon ${complete ? "complete" : job.state === "blocked" || job.state === "failed" ? "problem" : ""}`}>
-          {complete ? <Check size={20} /> : job.state === "blocked" || job.state === "failed" ? <TriangleAlert size={20} /> : <LoaderCircle size={20} className="spin" />}
+        <div className={`job-state-icon ${complete ? "complete" : job.state === "blocked" || job.state === "failed" || job.state === "partial" ? "problem" : ""}`}>
+          {complete ? <Check size={20} /> : job.state === "blocked" || job.state === "failed" || job.state === "partial" ? <TriangleAlert size={20} /> : <LoaderCircle size={20} className="spin" />}
         </div>
         <div className="job-title">
-          <span className="section-kicker">{complete ? "Import complete" : job.state === "blocked" ? "Action required" : "Import in progress"}</span>
+          <span className="section-kicker">{complete ? "Import complete" : job.state === "partial" ? "Source files needed" : job.state === "blocked" ? "Action required" : job.state === "failed" ? "Import failed" : "Import in progress"}</span>
           <h1>{job.title}</h1>
           <p>{job.summary || status || job.stage}</p>
         </div>
         <div className="job-header-actions">
-          {complete ? <AppButton tone="primary" icon={Plus} onClick={onNewImport}>New import</AppButton> : null}
+          {finished ? <AppButton tone="secondary" icon={Plus} onClick={onNewImport}>New import</AppButton> : null}
+          {job.state === "failed" || job.state === "partial" ? <AppButton tone="primary" icon={RefreshCw} disabled={handoffBusy} onClick={onRetry}>Retry sync</AppButton> : null}
         </div>
       </section>
-      <section className="job-progress-panel">
+      <section className={`job-progress-panel ${complete ? "is-complete" : ""}`}>
         <div className="job-progress-top">
-          <div><strong>{job.stage}</strong><span>{job.completed} of {job.total} tracks complete</span></div>
-          <strong className="progress-number">{Math.round(job.progress)}%</strong>
+          <div><strong>{job.stage}</strong><span>{progressDetail}</span></div>
+          {!complete ? <strong className="progress-number">{Math.round(job.progress)}%</strong> : <StatusBadge tone="success">Ready to play</StatusBadge>}
         </div>
-        <div className="progress-track"><span style={{ width: `${Math.max(job.progress, 2)}%` }} /></div>
+        {!complete ? <div className="progress-track" role="progressbar" aria-label="Import progress" aria-valuenow={Math.round(job.progress)} aria-valuemin={0} aria-valuemax={100}><span style={{ width: `${Math.max(job.progress, 2)}%` }} /></div> : null}
         <div className="job-metrics">
           <span><Clock3 size={13} />Started {timeAgo(job.startedAt)}</span>
           <span><Folder size={13} />{job.outputDir}</span>
           {job.playlistName ? <span><Disc3 size={13} />{job.playlistName}</span> : null}
+          {fallbackRecovered ? <span className="metric-fallback"><RefreshCw size={13} />{fallbackRecovered} recovered by KlickAud</span> : null}
+          {protectedCount ? <span className="metric-warning"><LockKeyhole size={13} />{protectedCount} protected</span> : null}
           {failed ? <span className="metric-danger"><AlertCircle size={13} />{failed} failed</span> : null}
         </div>
       </section>
+      {fallbackRecovered || failed || protectedCount ? (
+        <section className="download-outcome-strip" aria-label="Download fallback results" aria-live="polite">
+          {fallbackRecovered ? (
+            <div className="download-outcome recovered">
+              <span><RefreshCw size={16} /></span>
+              <div><strong>{fallbackRecovered} recovered by KlickAud</strong><small>The primary download failed, but the fallback returned a valid MP3.</small></div>
+            </div>
+          ) : null}
+          {failed || protectedCount ? (
+            <div className="download-outcome unresolved">
+              <span><AlertCircle size={16} /></span>
+              <div><strong>{failed + protectedCount} automatic download{failed + protectedCount === 1 ? "" : "s"} failed</strong><small>Both the primary method and KlickAud failed. Select a track for the full error.</small></div>
+            </div>
+          ) : null}
+        </section>
+      ) : null}
       {job.state === "blocked" ? (
         <div className="blocked-callout">
           <div className="blocked-icon"><Disc3 size={19} /></div>
@@ -839,25 +890,25 @@ function JobWorkspace({ job, status, onInspect, onNewImport, onFinishLater, onCl
   )
 }
 
-function TrackTable({ tracks, onInspect }: { tracks: JobTrack[]; onInspect: (track: JobTrack) => void }) {
+function TrackTable({ tracks, onInspect, library = false }: { tracks: JobTrack[]; onInspect: (track: JobTrack) => void; library?: boolean }) {
   return (
     <section className="data-table-wrap">
-      <div className="table-toolbar"><div><strong>Tracks</strong><span>{tracks.length} in this job</span></div></div>
+      {!library ? <div className="table-toolbar"><div><strong>Tracks</strong><span>{tracks.length} in this job</span></div></div> : null}
       <div className="track-table" role="table">
         <div className="track-table-head" role="row">
           <span className="col-status" /><span>Track</span><span>Stage</span><span>BPM</span><span>Key</span><span>Cues</span><span />
         </div>
         {tracks.map((track, index) => (
-          <button className={`track-table-row ${track.stage === "failed" ? "failed" : ""}`} role="row" key={track.id} onClick={() => onInspect(track)}>
+          <button className={`track-table-row ${track.stage === "failed" ? "failed" : track.stage === "protected" ? "protected" : track.downloadMethod === "klickaud" ? "fallback-recovered" : ""}`} role="row" key={track.id} onClick={() => onInspect(track)}>
             <span className="col-status">
-              {track.stage === "ready" ? <CheckCircle2 size={16} className="success-icon" /> : track.stage === "failed" ? <AlertCircle size={16} className="danger-icon" /> : track.stage === "queued" ? <span className="queue-dot" /> : <LoaderCircle size={15} className="spin blue-icon" />}
+              {track.stage === "ready" && track.downloadMethod === "klickaud" ? <RefreshCw size={15} className="fallback-icon" /> : track.stage === "ready" || track.stage === "resolved" ? <CheckCircle2 size={16} className="success-icon" /> : track.stage === "protected" ? <LockKeyhole size={15} className="warning-icon" /> : track.stage === "failed" || track.stage === "interrupted" ? <AlertCircle size={16} className="danger-icon" /> : track.stage === "queued" ? <span className="queue-dot" /> : <LoaderCircle size={15} className="spin blue-icon" />}
             </span>
-            <span className="track-cell"><span className="mini-art">{String(index + 1).padStart(2, "0")}</span><span><strong>{track.title}</strong><small>{track.artist}</small></span></span>
-            <span className="stage-cell"><span>{track.stage === "ready" ? "Ready" : track.stage.charAt(0).toUpperCase() + track.stage.slice(1)}</span><span className="tiny-progress"><i style={{ width: `${track.progress}%` }} /></span></span>
+            <span className="track-cell"><span className="mini-art">{String(index + 1).padStart(2, "0")}</span><span><strong title={track.title}>{track.title}</strong><small title={track.artist}>{track.artist || "Unknown artist"}</small></span></span>
+            <span className="stage-cell"><span>{track.stage === "ready" && track.downloadMethod === "klickaud" ? "Ready via KlickAud" : track.stage === "fallback" ? "Trying fallback" : track.stage === "ready" ? "Ready" : track.stage.charAt(0).toUpperCase() + track.stage.slice(1)}</span>{["downloading", "converting", "analyzing", "syncing", "fallback"].includes(track.stage) ? <span className="tiny-progress"><i style={{ width: `${track.progress}%` }} /></span> : null}</span>
             <span className="mono">{track.bpm ? track.bpm.toFixed(1) : "--"}</span>
             <span className="mono key-cell">{track.key || "--"}</span>
             <span>{track.cueStatus === "filled" ? <StatusBadge tone="success">Filled</StatusBadge> : track.cueStatus === "proposed" ? <StatusBadge tone="blue">Proposed</StatusBadge> : <span className="muted">Off</span>}</span>
-            <span className="row-arrow">-&gt;</span>
+            <ArrowRight className="row-arrow" size={15} aria-hidden="true" />
             {track.error ? <span className="row-error-detail">{track.error}</span> : null}
           </button>
         ))}
@@ -866,16 +917,16 @@ function TrackTable({ tracks, onInspect }: { tracks: JobTrack[]; onInspect: (tra
   )
 }
 
-function ActivityView({ jobs, onSelectJob, onInspect, onClearCompleted }: { jobs: ActivityJob[]; onSelectJob: (job: ActivityJob) => void; onInspect: (track: JobTrack) => void; onClearCompleted: () => void }) {
+function ActivityView({ jobs, onSelectJob, onClearCompleted }: { jobs: ActivityJob[]; onSelectJob: (job: ActivityJob) => void; onClearCompleted: () => void }) {
   const running = jobs.filter((job) => job.state === "running" || job.state === "blocked")
   return (
     <main className="workspace standard-workspace">
-      <PageIntro eyebrow="Job history" title="Activity" description="Imports keep their progress, exceptions, and Rekordbox handoff state in one place." />
+      <PageIntro eyebrow="Job history" title="Activity" description="Follow your imports, pick up where you left off." />
       {jobs.length === 0 ? <EmptyState icon={Activity} title="No jobs yet" description="Your first SoundCloud import will appear here with track-level progress." /> : (
         <>
           {running.length ? <div className="activity-section"><div className="section-toolbar compact"><div><span className="section-kicker">Now</span><h2>In progress</h2></div></div>{running.map((job) => <JobRow key={job.id} job={job} onClick={() => onSelectJob(job)} />)}</div> : null}
           <div className="activity-section"><div className="section-toolbar compact"><div><span className="section-kicker">History</span><h2>Recent jobs</h2></div><button className="text-button" onClick={onClearCompleted}>Clear completed</button></div>
-            {jobs.filter((job) => !running.includes(job)).map((job) => <JobRow key={job.id} job={job} onClick={() => { onSelectJob(job); if (job.tracks[0]) onInspect(job.tracks[0]) }} />)}
+            {jobs.filter((job) => !running.includes(job)).map((job) => <JobRow key={job.id} job={job} onClick={() => onSelectJob(job)} />)}
           </div>
         </>
       )}
@@ -885,30 +936,39 @@ function ActivityView({ jobs, onSelectJob, onInspect, onClearCompleted }: { jobs
 
 function JobRow({ job, onClick }: { job: ActivityJob; onClick: () => void }) {
   const tone = job.state === "complete" ? "success" : job.state === "partial" || job.state === "blocked" ? "warning" : job.state === "failed" ? "danger" : "blue"
+  const fallbackRecovered = job.tracks.filter((track) => track.stage === "ready" && track.downloadMethod === "klickaud").length
   return (
     <button className="job-row" onClick={onClick}>
       <span className={`job-row-icon job-${tone}`}>{job.state === "complete" ? <Check size={16} /> : job.state === "running" ? <LoaderCircle size={16} className="spin" /> : <AlertCircle size={16} />}</span>
-      <span className="job-row-name"><strong>{job.title}</strong><small>{job.stage} · {job.completed}/{job.total} tracks</small></span>
+      <span className="job-row-name"><strong>{job.title}</strong><small>{job.stage} · {job.completed}/{job.total} tracks{fallbackRecovered ? ` · ${fallbackRecovered} fallback` : ""}</small></span>
       <span className="job-row-destination">{job.playlistName || job.outputDir}</span>
       <span className="job-row-progress"><i><b style={{ width: `${job.progress}%` }} /></i><small>{Math.round(job.progress)}%</small></span>
       <span className="job-row-time">{timeAgo(job.startedAt)}</span>
-      <span className="row-arrow">-&gt;</span>
+      <ArrowRight className="row-arrow" size={15} aria-hidden="true" />
     </button>
   )
 }
 
 function DownloadsView({ jobs, onInspect, onAddSource }: { jobs: ActivityJob[]; onInspect: (track: JobTrack) => void; onAddSource: () => void }) {
-  const tracks = jobs.flatMap((job) => job.tracks.filter((track) => track.stage === "ready"))
+  const tracks = useMemo(() => {
+    const unique = new Map<string, JobTrack>()
+    for (const job of jobs) for (const track of job.tracks) {
+      const key = track.id || track.path || `${track.title}:${track.artist}`
+      if (["ready", "resolved"].includes(track.stage) && !unique.has(key)) unique.set(key, track)
+    }
+    return [...unique.values()]
+  }, [jobs])
+  const [sort, setSort] = useState("recent")
   const [query, setQuery] = useState("")
-  const filtered = tracks.filter((track) => `${track.title} ${track.artist} ${track.key || ""}`.toLowerCase().includes(query.toLowerCase()))
+  const filtered = tracks.filter((track) => `${track.title} ${track.artist} ${track.key || ""}`.toLowerCase().includes(query.toLowerCase())).sort((a, b) => sort === "title" ? a.title.localeCompare(b.title) : sort === "artist" ? a.artist.localeCompare(b.artist) : sort === "bpm" ? (b.bpm ?? 0) - (a.bpm ?? 0) : 0)
   return (
     <main className="workspace standard-workspace">
-      <PageIntro eyebrow="Local library" title="Downloads" description="Prepared files grouped across recent SoundCloud sources." actions={<AppButton tone="primary" icon={Plus} onClick={onAddSource}>Add source</AppButton>} />
+      <PageIntro eyebrow="Local library" title="Downloads" description="Your music, prepared and ready for the next set." actions={<AppButton tone="primary" icon={Plus} onClick={onAddSource}>Add source</AppButton>} />
       <div className="library-toolbar">
         <label className="search-field"><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search tracks, artists, keys..." /></label>
-        <span className="toolbar-count">{filtered.length} tracks</span>
+        <select className="sort-select" aria-label="Sort tracks" value={sort} onChange={(event) => setSort(event.target.value)}><option value="recent">Recently added</option><option value="title">Title A–Z</option><option value="artist">Artist A–Z</option><option value="bpm">BPM high to low</option></select><span className="toolbar-count">{filtered.length} tracks</span>
       </div>
-      {filtered.length ? <TrackTable tracks={filtered} onInspect={onInspect} /> : <EmptyState icon={FileAudio} title="No prepared tracks" description="Completed downloads appear here after your first import." />}
+      {filtered.length ? <TrackTable tracks={filtered} onInspect={onInspect} library /> : <EmptyState icon={query ? Search : FileAudio} title={query ? "No matching tracks" : "Your collection starts here"} description={query ? "Try another title, artist, or key." : "Add a SoundCloud source to prepare your first tracks."} />}
     </main>
   )
 }
@@ -935,29 +995,26 @@ function RekordboxView({ playlists, onReload, loading, onInspect, onToast }: { p
 
   return (
     <main className="workspace standard-workspace">
-      <PageIntro eyebrow="Collection" title="Rekordbox playlists" description="Inspect cached playlist state and run guarded, backed-up changes." actions={<AppButton tone="secondary" icon={RefreshCw} loading={loading} onClick={onReload}>Refresh</AppButton>} />
-      <div className="rekordbox-healthbar">
-        <div><span className="health-icon"><ShieldCheck size={17} /></span><span><strong>Safe write policy active</strong><small>Occupied hot-cue slots are never overwritten.</small></span></div>
-        <StatusBadge tone="success">Guarded access</StatusBadge>
-      </div>
+      <PageIntro eyebrow="Collection" title="Rekordbox playlists" description="Explore your playlists, fine-tune tracks, and get ready to play." actions={<AppButton tone="secondary" icon={RefreshCw} loading={loading} onClick={onReload}>Refresh</AppButton>} />
       <div className="library-toolbar">
         <label className="search-field"><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search playlists..." /></label>
         <span className="toolbar-count">{visible.length} playlists</span>
       </div>
       <section className="playlist-table">
-        <div className="playlist-table-head"><span>Playlist</span><span>Tracks</span><span>Access</span><span /></div>
+        <div className="playlist-table-head"><span>Playlist</span><span>Tracks</span><span /><span /></div>
         {visible.map((playlist) => (
           <div className="playlist-row" key={playlist.id}>
-            <button className="playlist-main" onClick={() => onInspect(playlist)}><span className="playlist-icon"><ListMusic size={16} /></span><span><strong>{playlist.name}</strong><small>{playlist.path}</small></span></button>
+            <button className="playlist-main" onClick={() => onInspect(playlist)}><span className="playlist-icon"><ListMusic size={16} /></span><span><strong>{playlist.name}</strong>{playlist.path !== playlist.name ? <small>{playlist.path}</small> : <small>Rekordbox playlist</small>}</span></button>
             <span className="mono">{playlist.song_count}</span>
-            <StatusBadge tone="success">Loaded</StatusBadge>
+            <ArrowRight size={15} className="muted" aria-hidden="true" />
             <div className="playlist-actions"><button className="icon-button" title="Remove generated hot cues" aria-label={`Remove generated hot cues from ${playlist.name}`} onClick={() => setRemoving(playlist)}><Trash2 size={15} /></button></div>
           </div>
         ))}
       </section>
+      {!visible.length ? <EmptyState icon={query ? Search : ListMusic} title={query ? "No matching playlists" : loading ? "Loading playlists…" : "No playlists yet"} description={query ? "Try a different playlist name." : "Import a source into Rekordbox to start your collection."} /> : null}
       {removing ? (
         <Modal title="Remove generated hot cues?" icon={Trash2} onClose={() => !removeBusy && setRemoving(null)}>
-          <p>This removes only cues verified as generated by SoundCloud DL from tracks in <strong>{removing.name}</strong>.</p>
+          <p>This removes only cues verified as generated by this app from tracks in <strong>{removing.name}</strong>.</p>
           <div className="modal-warning"><TriangleAlert size={16} /><span>Cues belong to tracks, so the change appears everywhere those tracks are used. Manual and unrecognized cues remain untouched.</span></div>
           <div className="modal-detail"><ShieldCheck size={15} /><span>A timestamped Rekordbox database backup is created first.</span></div>
           <div className="modal-actions"><AppButton tone="secondary" onClick={() => setRemoving(null)} disabled={removeBusy}>Cancel</AppButton><AppButton tone="danger" icon={Trash2} loading={removeBusy} onClick={removeCues}>Remove generated cues</AppButton></div>
@@ -1023,12 +1080,13 @@ function DoctorView({ onToast, usbDevices, onRekordboxStatus }: { onToast: (mess
     { icon: HardDrive, label: "Bundled media engine", detail: isDesktopRuntime ? "Self-contained worker and ffmpeg available" : "Browser preview uses simulated engine data", tone: "success" },
     { icon: Usb, label: "USB export", detail: usb ? `${usb.name} · ${usb.rekordbox_export ? "Rekordbox export found" : "Ready for export from Rekordbox"}` : "No removable USB device detected", tone: usb ? "success" : "neutral" },
   ] as Array<{ icon: LucideIcon; label: string; detail: string; tone: "neutral" | "success" | "warning" | "danger" | "blue"; action?: string; onAction?: () => void }>
+  if (!doctor) return <main className="workspace standard-workspace"><PageIntro eyebrow="Diagnostics" title="Rekordbox Doctor" description="Check your collection before the next set." /><EmptyState icon={loading ? LoaderCircle : ShieldCheck} title={loading ? "Checking your library…" : "Could not read diagnostics"} description={loading ? "Reading local files, cues, and the Rekordbox beat grid." : "Try running the checks again."} />{!loading ? <AppButton onClick={load} icon={RefreshCw}>Run checks</AppButton> : null}</main>
   return (
     <main className="workspace standard-workspace">
       <PageIntro eyebrow="Safety and repair" title="Rekordbox Doctor" description="Inspect every repair before it touches the library." actions={<AppButton tone="secondary" icon={RefreshCw} loading={loading} onClick={load}>Run checks</AppButton>} />
       <div className="doctor-summary">
         <div className="doctor-score"><span><ShieldCheck size={22} /></span><div><strong>{issueCount ? "Review recommended" : "Library looks healthy"}</strong><small>{loading ? "Running diagnostics..." : "Last checked just now"}</small></div></div>
-        <div className="doctor-stat"><strong>{Math.max(0, checks.length - checks.filter((check) => check.tone === "warning" || check.tone === "danger").length)}</strong><span>Checks passed</span></div>
+        <div className="doctor-stat"><strong>{Math.max(0, checks.filter((check) => check.tone === "success").length)}</strong><span>Checks passed</span></div>
         <div className="doctor-stat warning"><strong>{activeLoops + offGridLoops}</strong><span>Repairs available</span></div>
       </div>
       <section className="doctor-list">
@@ -1047,7 +1105,7 @@ function DoctorView({ onToast, usbDevices, onRekordboxStatus }: { onToast: (mess
       <div className="backup-callout"><ShieldCheck size={16} /><div><strong>Repairs are transactional</strong><span>Every database mutation creates a timestamped backup, applies one scoped change, and verifies the result.</span></div></div>
       {repair ? <Modal title={repair === "active" ? "Disable generated active loops?" : "Align generated loops to the beat grid?"} icon={repair === "active" ? CircleDot : Gauge} onClose={() => !repairing && setRepair(null)}>
         <p>{repair === "active" ? `${activeLoops} generated loops will stop auto-activating when a track loads.` : `${offGridLoops} generated loops will be moved onto Rekordbox beat-grid lines.`}</p>
-        <div className="modal-detail"><ShieldCheck size={15} /><span>Only verified SoundCloud DL loops are changed. A database backup is created first.</span></div>
+        <div className="modal-detail"><ShieldCheck size={15} /><span>Only verified app-generated loops are changed. A database backup is created first.</span></div>
         <div className="modal-actions"><AppButton tone="secondary" onClick={() => setRepair(null)} disabled={repairing}>Cancel</AppButton><AppButton tone="primary" icon={repair === "active" ? CircleDot : Gauge} loading={repairing} onClick={applyRepair}>Apply repair</AppButton></div>
       </Modal> : null}
     </main>
@@ -1057,15 +1115,19 @@ function DoctorView({ onToast, usbDevices, onRekordboxStatus }: { onToast: (mess
 function SettingsView({ config, onSave, theme, onTheme }: { config: AppConfig | null; onSave: (config: AppConfig) => Promise<void>; theme: Theme; onTheme: (theme: Theme) => void }) {
   const [draft, setDraft] = useState<AppConfig>(config ?? mockConfig)
   const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState("")
+  const dirty = JSON.stringify(config) !== JSON.stringify(draft)
   useEffect(() => { if (config) setDraft(config) }, [config])
   const update = <K extends keyof AppConfig>(key: K, value: AppConfig[K]) => setDraft((current) => ({ ...current, [key]: value }))
   const save = async () => {
     setSaving(true)
-    try { await onSave(draft) } finally { setSaving(false) }
+    setSaveError("")
+    try { await onSave(draft) } catch (reason) { setSaveError(reason instanceof Error ? reason.message : String(reason)) } finally { setSaving(false) }
   }
   return (
     <main className="workspace standard-workspace settings-workspace">
-      <PageIntro eyebrow="Preferences" title="Settings" description="Simple defaults here; expert concurrency remains automatic." actions={<AppButton tone="primary" icon={Check} loading={saving} onClick={save}>Save changes</AppButton>} />
+      <PageIntro eyebrow="Preferences" title="Settings" description="Make Crate feel at home in your workflow." actions={<AppButton tone="primary" icon={Check} loading={saving} disabled={!dirty || !config} onClick={save}>Save changes</AppButton>} />
+      {saveError ? <InlineError message={saveError} /> : null}
       <section className="settings-section">
         <div className="settings-section-title"><h2>SoundCloud</h2><p>Saved public source identity and default location.</p></div>
         <div className="settings-fields">
@@ -1088,14 +1150,14 @@ function SettingsView({ config, onSave, theme, onTheme }: { config: AppConfig | 
       </section>
       <section className="settings-section">
         <div className="settings-section-title"><h2>Engine</h2><p>Bundled and versioned with the app.</p></div>
-        <div className="settings-fields"><div className="engine-info"><span className="engine-ready"><Check size={14} /></span><span><strong>SoundCloud engine ready</strong><small>320 kbps MP3 · {draft.workers} download workers · {draft.fragments} fragments</small></span><span className="mono">v0.1.0</span></div></div>
+        <div className="settings-fields"><div className="engine-info"><span className="engine-ready"><Check size={14} /></span><span><strong>Crate desktop</strong><small>MP3 audio · automatic parallel downloads</small></span><span className="mono">v0.1.0</span></div></div>
       </section>
     </main>
   )
 }
 
 function SettingsToggle({ label, detail, value, onChange }: { label: string; detail: string; value: boolean; onChange: (value: boolean) => void }) {
-  return <div className="settings-inline"><span><strong>{label}</strong><small>{detail}</small></span><button className={`toggle ${value ? "on" : ""}`} role="switch" aria-checked={value} onClick={() => onChange(!value)}><span /></button></div>
+  return <div className="settings-inline"><span><strong>{label}</strong><small>{detail}</small></span><button className={`toggle ${value ? "on" : ""}`} role="switch" aria-label={label} aria-checked={value} onClick={() => onChange(!value)}><span /></button></div>
 }
 
 function PageIntro({ eyebrow, title, description, actions }: { eyebrow: string; title: string; description: string; actions?: ReactNode }) {
@@ -1107,21 +1169,13 @@ function EmptyState({ icon: Icon, title, description }: { icon: LucideIcon; titl
 }
 
 function Modal({ title, icon: Icon, children, onClose }: { title: string; icon: LucideIcon; children: ReactNode; onClose: () => void }) {
-  useEffect(() => {
-    const listener = (event: KeyboardEvent) => { if (event.key === "Escape") onClose() }
-    window.addEventListener("keydown", listener)
-    return () => window.removeEventListener("keydown", listener)
-  }, [onClose])
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><div className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div className="modal-head"><span><Icon size={17} /></span><h2 id="modal-title">{title}</h2><button className="icon-button" onClick={onClose} aria-label="Close"><X size={16} /></button></div><div className="modal-body">{children}</div></div></div>
+  const dialogRef = useDialogFocus(onClose)
+
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div className="modal-head"><span><Icon size={17} /></span><h2 id="modal-title">{title}</h2><button className="icon-button" onClick={onClose} aria-label="Close"><X size={16} /></button></div><div className="modal-body">{children}</div></div></div>
 }
 
-function LocalWaveform({ seed = "track", compact = false }: { seed?: string; compact?: boolean }) {
-  const bars = useMemo(() => Array.from({ length: compact ? 46 : 94 }, (_, index) => {
-    let value = 0
-    for (let char = 0; char < seed.length; char += 1) value += seed.charCodeAt(char) * (index + char + 3)
-    return 18 + ((value * 17 + index * 31) % 72)
-  }), [seed, compact])
-  return <div className={`waveform ${compact ? "compact" : ""}`}>{bars.map((height, index) => <i key={index} style={{ height: `${height}%` }} className={index < bars.length * 0.36 ? "played" : ""} />)}{!compact ? <><span className="wave-playhead" /><span className="cue-marker cue-a" style={{ left: "8%" }}>A</span><span className="cue-marker cue-b" style={{ left: "27%" }}>B</span><span className="cue-marker cue-c" style={{ left: "48%" }}>C</span><span className="cue-loop" style={{ left: "72%", width: "9%" }}><b>E</b></span></> : null}</div>
+function LocalWaveform({ compact = false }: { seed?: string; compact?: boolean }) {
+  return <div className={`local-waveform-placeholder ${compact ? "compact" : ""}`}><AudioLines size={28} aria-hidden="true" /><span>Open the editor to preview this audio</span><small>Rekordbox waveform available after analysis in Rekordbox</small></div>
 }
 
 function cuePad(cue: RekordboxCuePoint): string {
@@ -1159,23 +1213,23 @@ function RekordboxWaveformCanvas({ waveform, lane, label }: { waveform: Rekordbo
       context.setTransform(ratio, 0, 0, ratio, 0, 0)
       context.clearRect(0, 0, rect.width, rect.height)
 
-      const center = rect.height / 2
-      const step = rect.width / Math.max(lane.heights.length, 1)
-      lane.heights.forEach((rawHeight, index) => {
-        const height = Math.max(1, Math.min(1, rawHeight) * (rect.height - 18))
-        const color = lane.colors[index] ?? [56, 168, 232]
-        context.fillStyle = `rgb(${color[0] ?? 56}, ${color[1] ?? 168}, ${color[2] ?? 232})`
-        context.globalAlpha = 0.86
-        context.fillRect(index * step, center - height / 2, Math.max(1, step + 0.25), height)
+      drawRekordboxWaveform(context, lane, {
+        width: rect.width,
+        height: rect.height,
+        durationSec: waveform.duration_sec,
+        layout: lane.sample_rate_hz ? "mirrored" : "overview",
+        topPadding: lane.sample_rate_hz ? 5 : 2,
+        bottomPadding: lane.sample_rate_hz ? 5 : 2,
+        opacity: .94,
       })
-      context.globalAlpha = 1
 
-      for (const beat of waveform.beat_grid) {
-        if (beat.beat_number !== 1) continue
-        const x = beat.time_sec / waveform.duration_sec * rect.width
-        context.fillStyle = "rgba(255, 255, 255, 0.24)"
-        context.fillRect(Math.round(x), 2, 1, rect.height - 4)
-      }
+      drawRekordboxBeatGrid(context, waveform.beat_grid, {
+        width: rect.width,
+        height: rect.height,
+        durationSec: waveform.duration_sec,
+        top: 2,
+        bottom: rect.height - 2,
+      })
 
       for (const cue of waveform.cues) {
         if (cue.in_sec < 0 || cue.in_sec > waveform.duration_sec) continue
@@ -1231,7 +1285,7 @@ function PlaylistInspector({ playlist, onClose, onInspect, onOpenRekordbox }: { 
     <aside className="inspector">
       <div className="inspector-head"><strong>Playlist</strong><button className="icon-button" onClick={onClose} aria-label="Close inspector"><X size={15} /></button></div>
       <div className="inspector-scroll">
-        <div className="playlist-inspector-art"><ListMusic size={28} /><LocalWaveform seed={playlist.name} compact /></div>
+        <div className="playlist-inspector-art" aria-hidden="true"><ListMusic size={36} /><span className="playlist-cover-type">CRATE / COLLECTION</span></div>
         <div className="inspector-title"><span className="section-kicker">Rekordbox playlist</span><h2>{playlist.name}</h2><p>{playlist.path}</p></div>
         <div className="inspector-metrics"><div><strong>{playlist.song_count}</strong><span>Tracks</span></div><div><strong>{missing}</strong><span>Missing</span></div><div><strong>{tracks.filter((track) => track.soundcloud_dl_managed).length}</strong><span>Managed</span></div></div>
         <div className="inspector-section playlist-track-section">
@@ -1254,26 +1308,98 @@ function PlaylistInspector({ playlist, onClose, onInspect, onOpenRekordbox }: { 
   )
 }
 
-function LocalTrackInspector({ track, onClose }: { track: JobTrack; onClose: () => void }) {
+function LocalTrackInspector({ track, onClose, onEdit, onResolveProtected }: { track: JobTrack; onClose: () => void; onEdit: (target: EditorTarget) => void; onResolveProtected: (track: JobTrack) => Promise<void> }) {
+  const [resolving, setResolving] = useState(false)
+  const [confirmingSource, setConfirmingSource] = useState(false)
+  const [resolveError, setResolveError] = useState("")
+
+  const resolveProtected = async () => {
+    setConfirmingSource(false)
+    setResolving(true)
+    setResolveError("")
+    try {
+      await onResolveProtected(track)
+    } catch (reason) {
+      setResolveError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setResolving(false)
+    }
+  }
+
+  if (track.stage === "failed") return (
+    <aside className="inspector">
+      <div className="inspector-head"><strong>Failed download</strong><button className="icon-button" onClick={onClose} aria-label="Close inspector"><X size={15} /></button></div>
+      <div className="inspector-scroll">
+        <div className="track-inspector-top"><div className="large-art failed-art"><AlertCircle size={27} /></div><div><h2>{track.title}</h2><p>{track.artist}</p><span className="source-link">SoundCloud <ExternalLink size={10} /></span></div></div>
+        <div className="download-attempt-notice failed">
+          <TriangleAlert size={18} />
+          <div><strong>Both download methods failed</strong><span>yt-dlp could not download this track, and KlickAud did not recover it.</span></div>
+        </div>
+        <div className="inspector-section download-error-section">
+          <div className="inspector-section-head"><h3>Download error</h3><StatusBadge tone="danger">Failed</StatusBadge></div>
+          <p>{track.error || "No detailed error was returned."}</p>
+          {track.primaryDownloadError ? <div className="download-attempt-detail"><strong>Primary attempt</strong><span>{track.primaryDownloadError}</span></div> : null}
+        </div>
+      </div>
+    </aside>
+  )
+
+  if (track.stage === "protected") return (
+    <aside className="inspector">
+      <div className="inspector-head"><strong>Protected track</strong><button className="icon-button" onClick={onClose} aria-label="Close inspector"><X size={15} /></button></div>
+      <div className="inspector-scroll">
+        <div className="track-inspector-top"><div className="large-art protected-art"><LockKeyhole size={27} /></div><div><h2>{track.title}</h2><p>{track.artist}</p><span className="source-link">SoundCloud <ExternalLink size={10} /></span></div></div>
+        <div className="protected-track-notice">
+          <LockKeyhole size={18} />
+          <div><strong>Encrypted playback only</strong><span>SoundCloud does not expose an authorized downloadable stream for this track.</span></div>
+        </div>
+        {track.error ? <div className="download-attempt-detail"><strong>Automatic attempts</strong><span>{track.error}</span></div> : null}
+        <div className="inspector-section protected-resolution">
+          <div className="inspector-section-head"><h3>Attach a source file</h3><StatusBadge tone="warning">Required</StatusBadge></div>
+          <p>Select an artist-authorized download, purchased copy, or another audio file you are licensed to use. Crate will copy or convert it, analyze it, and bind it to track ID <span className="mono">{track.id}</span>.</p>
+          <div className="rights-note"><ShieldCheck size={15} /><span>You are responsible for having rights for your intended use. Non-commercial use alone does not grant download or performance rights.</span></div>
+          {resolveError ? <InlineError message={resolveError} /> : null}
+        </div>
+        <div className="inspector-actions"><AppButton tone="primary" icon={FileUp} loading={resolving} onClick={() => setConfirmingSource(true)}>Choose licensed audio</AppButton></div>
+      </div>
+      {confirmingSource ? (
+        <Modal title="Attach a licensed source?" icon={ShieldCheck} onClose={() => !resolving && setConfirmingSource(false)}>
+          <p>Continue only with an artist-authorized download, purchased copy, promotional file, or other audio you have permission to use.</p>
+          <div className="modal-warning"><TriangleAlert size={16} /><span>SoundCloud playback access does not grant download, public-performance, distribution, or commercial-use rights. Non-commercial use by itself is not permission.</span></div>
+          <div className="modal-detail"><LockKeyhole size={15} /><span>The app will not decrypt SoundCloud's protected stream. It will manage only the local file you select.</span></div>
+          <div className="modal-actions"><AppButton tone="secondary" onClick={() => setConfirmingSource(false)}>Cancel</AppButton><AppButton tone="primary" icon={FileUp} onClick={() => void resolveProtected()}>Choose file</AppButton></div>
+        </Modal>
+      ) : null}
+    </aside>
+  )
+
   return (
     <aside className="inspector">
       <div className="inspector-head"><strong>Track inspector</strong><button className="icon-button" onClick={onClose} aria-label="Close inspector"><X size={15} /></button></div>
       <div className="inspector-scroll">
         <div className="track-inspector-top"><div className="large-art"><Music2 size={27} /><span>{track.key || "--"}</span></div><div><h2>{track.title}</h2><p>{track.artist}</p><span className="source-link">SoundCloud <ExternalLink size={10} /></span></div></div>
+        {track.downloadMethod === "klickaud" ? (
+          <div className="download-attempt-notice recovered">
+            <RefreshCw size={18} />
+            <div><strong>Recovered by KlickAud</strong><span>The primary download failed, then the fallback returned and saved a valid MP3.</span></div>
+          </div>
+        ) : null}
+        {track.downloadMethod === "klickaud" && track.primaryDownloadError ? <div className="download-attempt-detail"><strong>Primary attempt</strong><span>{track.primaryDownloadError}</span></div> : null}
+        {track.stage === "interrupted" ? <InlineError message={track.error || "Import interrupted. Retry sync to continue."} /> : null}
         <div className="wave-source-row"><StatusBadge tone="neutral">Local preview</StatusBadge><span>Available before Rekordbox analysis</span></div>
         <LocalWaveform seed={track.title} />
-        <div className="wave-legend"><span><i className="legend-downbeat" />Downbeat</span><span><i className="legend-cue" />Hot cue</span><span><i className="legend-loop" />Loop</span></div>
-        <div className="inspector-metrics"><div><strong className="mono">{track.bpm?.toFixed(1) || "--"}</strong><span>BPM</span></div><div><strong className="mono">{track.key || "--"}</strong><span>Key</span></div><div><strong>7</strong><span>Energy</span></div></div>
+        <div className="inspector-metrics"><div><strong className="mono">{track.bpm?.toFixed(1) || "--"}</strong><span>BPM</span></div><div><strong className="mono">{track.key || "--"}</strong><span>Key</span></div><div><strong>{track.path ? track.path.split(".").pop()?.toUpperCase() : "—"}</strong><span>Format</span></div></div>
         <div className="inspector-section cue-preview"><div className="inspector-section-head"><h3>Hot cues</h3><StatusBadge tone={track.cueStatus === "filled" ? "success" : "neutral"}>{track.cueStatus}</StatusBadge></div>
-          {[{ pad: "A", name: "Intro", color: "pink" }, { pad: "B", name: "Phrase 16", color: "blue" }, { pad: "C", name: "Phrase 32", color: "green" }, { pad: "D", name: "Intro Loop", color: "orange" }, { pad: "E", name: "Exit Loop", color: "amber" }].map((cue) => <div className="cue-row" key={cue.pad}><span className={`cue-pad cue-${cue.color}`}>{cue.pad}</span><strong>{cue.name}</strong><span>{track.cueStatus === "filled" ? "Written" : "Suggested"}</span></div>)}
+          <p className="inspector-helper">{track.cueStatus === "off" ? "Hot-cue generation is off for this import." : "Open this track from Rekordbox playlists to inspect the actual saved cues and their timing."}</p>
         </div>
         <div className="cue-safety-note"><ShieldCheck size={15} /><span>Existing occupied slots are always preserved.</span></div>
+        <div className="inspector-actions"><AppButton tone="primary" icon={SlidersHorizontal} disabled={!track.path} onClick={() => track.path && onEdit({ path: track.path, title: track.title, artist: track.artist })}>Open editor</AppButton></div>
       </div>
     </aside>
   )
 }
 
-function RekordboxTrackInspector({ track, playlist, onClose }: { track: PlaylistTrack; playlist: Playlist; onClose: () => void }) {
+function RekordboxTrackInspector({ track, playlist, onClose, onBack, onEdit }: { onBack: () => void; track: PlaylistTrack; playlist: Playlist; onClose: () => void; onEdit: (target: EditorTarget) => void }) {
   const [waveform, setWaveform] = useState<RekordboxWaveform | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState("")
@@ -1305,14 +1431,14 @@ function RekordboxTrackInspector({ track, playlist, onClose }: { track: Playlist
   const bpm = waveform?.beat_grid.find((beat) => beat.bpm > 0)?.bpm
   return (
     <aside className="inspector">
-      <div className="inspector-head"><strong>Track inspector</strong><button className="icon-button" onClick={onClose} aria-label="Close inspector"><X size={15} /></button></div>
+      <div className="inspector-head"><button className="icon-button" aria-label="Back to playlist" onClick={onBack}><ArrowLeft size={16} /></button><strong>Track details</strong><button className="icon-button" onClick={onClose} aria-label="Close inspector"><X size={15} /></button></div>
       <div className="inspector-scroll">
         <div className="track-inspector-top"><div className="large-art"><Disc3 size={27} /><span>RB</span></div><div><h2>{track.title}</h2><p>{track.artist || "Unknown artist"}</p><span className="source-link">{playlist.name}</span></div></div>
-        <div className="wave-source-row">{waveform ? <><StatusBadge tone="success">Rekordbox analysis</StatusBadge><span>{waveform.preview?.tag || "No preview"} overview · {waveform.detail?.tag || "No detail"} detail</span></> : <><StatusBadge tone="neutral">Awaiting analysis</StatusBadge><span>No authoritative ANLZ waveform yet</span></>}</div>
+        <div className="wave-source-row">{waveform ? <><StatusBadge tone="success">Rekordbox analysis</StatusBadge><span>{waveformFormatLabel(waveform.preview)} overview · {waveformFormatLabel(waveform.detail)} detail</span></> : <><StatusBadge tone="neutral">Awaiting analysis</StatusBadge><span>No authoritative ANLZ waveform yet</span></>}</div>
         {loading ? <div className="waveform-loading"><LoaderCircle className="spin" size={16} /><span>Reading Rekordbox ANLZ data...</span></div> : null}
         {error ? <InlineError message={error} /> : null}
-        {waveform?.preview ? <div className="authoritative-waveform"><span>Full track</span><RekordboxWaveformCanvas waveform={waveform} lane={waveform.preview} label={`${track.title} Rekordbox color overview waveform`} /></div> : null}
-        {waveform?.detail ? <div className="authoritative-waveform detail-waveform"><span>Detail</span><RekordboxWaveformCanvas waveform={waveform} lane={waveform.detail} label={`${track.title} Rekordbox color detail waveform`} /></div> : null}
+        {waveform?.preview ? <div className="authoritative-waveform"><span>Full track</span><RekordboxWaveformCanvas waveform={waveform} lane={waveform.preview} label={`${track.title} native Rekordbox overview waveform`} /></div> : null}
+        {waveform?.detail ? <div className="authoritative-waveform detail-waveform"><span>Detail</span><RekordboxWaveformCanvas waveform={waveform} lane={waveform.detail} label={`${track.title} native Rekordbox detail waveform`} /></div> : null}
         {waveform ? <div className="wave-legend"><span><i className="legend-downbeat" />PQTZ downbeat</span><span><i className="legend-cue" />Database cue</span><span><i className="legend-loop" />Loop range</span></div> : null}
         <div className="inspector-metrics"><div><strong className="mono">{bpm?.toFixed(1) || "--"}</strong><span>BPM</span></div><div><strong>{waveform?.beat_grid.length ?? "--"}</strong><span>Beats</span></div><div><strong className="mono">{formatDuration(waveform?.duration_sec ?? 0)}</strong><span>Length</span></div></div>
         {waveform ? <div className="inspector-section cue-preview"><div className="inspector-section-head"><h3>Database cues</h3><StatusBadge tone="success">Exact timing</StatusBadge></div>
@@ -1321,12 +1447,13 @@ function RekordboxTrackInspector({ track, playlist, onClose }: { track: Playlist
         </div> : null}
         {waveform ? <div className="anlz-proof"><ShieldCheck size={14} /><span><strong>Authoritative Rekordbox data</strong><small>{waveform.fingerprint.slice(0, 12)} · {waveform.files.map((file) => file.kind).join(" + ")}</small></span></div> : null}
         {!track.file_exists ? <div className="cue-safety-note missing-file-note"><AlertCircle size={15} /><span>The audio file is missing, but Rekordbox's cached waveform remains inspectable.</span></div> : null}
+        <div className="inspector-actions"><AppButton tone="primary" icon={SlidersHorizontal} disabled={!track.file_exists || !waveform} onClick={() => onEdit({ contentId: track.content_id, path: track.folder_path, title: track.title, artist: track.artist })}>Open editor</AppButton></div>
       </div>
     </aside>
   )
 }
 
-function Inspector({ item, onClose, onInspect, onOpenRekordbox }: { item: InspectorItem; onClose: () => void; onInspect: (item: InspectorItem) => void; onOpenRekordbox: () => void }) {
+function Inspector({ item, onClose, onInspect, onOpenRekordbox, onEdit, onResolveProtected }: { item: InspectorItem; onClose: () => void; onInspect: (item: InspectorItem) => void; onOpenRekordbox: () => void; onEdit: (target: EditorTarget) => void; onResolveProtected: (track: JobTrack) => Promise<void> }) {
   if (!item) return (
     <aside className="inspector empty-inspector">
       <div className="inspector-head"><strong>Inspector</strong><button className="icon-button" onClick={onClose} aria-label="Close inspector"><X size={15} /></button></div>
@@ -1334,8 +1461,8 @@ function Inspector({ item, onClose, onInspect, onOpenRekordbox }: { item: Inspec
     </aside>
   )
   if (item.kind === "playlist") return <PlaylistInspector playlist={item.playlist} onClose={onClose} onInspect={onInspect} onOpenRekordbox={onOpenRekordbox} />
-  if (item.kind === "rekordbox-track") return <RekordboxTrackInspector track={item.track} playlist={item.playlist} onClose={onClose} />
-  return <LocalTrackInspector track={item.track} onClose={onClose} />
+  if (item.kind === "rekordbox-track") return <RekordboxTrackInspector track={item.track} playlist={item.playlist} onBack={() => onInspect({ kind: "playlist", playlist: item.playlist })} onClose={onClose} onEdit={onEdit} />
+  return <LocalTrackInspector track={item.track} onClose={onClose} onEdit={onEdit} onResolveProtected={onResolveProtected} />
 }
 
 type ToastTone = "success" | "danger" | "neutral"
@@ -1343,18 +1470,6 @@ interface ToastItem { id: string; message: string; tone: ToastTone }
 
 function Toasts({ items, onDismiss }: { items: ToastItem[]; onDismiss: (id: string) => void }) {
   return <div className="toasts" aria-live="polite">{items.map((item) => <div className={`toast toast-${item.tone}`} key={item.id}>{item.tone === "success" ? <CheckCircle2 size={16} /> : item.tone === "danger" ? <AlertCircle size={16} /> : <Info size={16} />}<span>{item.message}</span><button onClick={() => onDismiss(item.id)} aria-label="Dismiss"><X size={14} /></button></div>)}</div>
-}
-
-function CommandPalette({ onClose, onNavigate }: { onClose: () => void; onNavigate: (view: ViewId) => void }) {
-  const [query, setQuery] = useState("")
-  const actions: { label: string; detail: string; icon: LucideIcon; view: ViewId }[] = [
-    { label: "Start a new import", detail: "Paste a SoundCloud URL", icon: Plus, view: "import" },
-    { label: "Open Rekordbox playlists", detail: "Inspect and sync playlists", icon: Disc3, view: "rekordbox" },
-    { label: "Run Rekordbox Doctor", detail: "Diagnostics and repairs", icon: ShieldCheck, view: "doctor" },
-    { label: "Open settings", detail: "Storage and defaults", icon: Settings, view: "settings" },
-  ]
-  const visible = actions.filter((action) => `${action.label} ${action.detail}`.toLowerCase().includes(query.toLowerCase()))
-  return <div className="palette-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><div className="palette"><label><Search size={17} /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search commands..." /><kbd>ESC</kbd></label><div className="palette-section"><span>Actions</span>{visible.map((action) => { const Icon = action.icon; return <button key={action.label} onClick={() => { onNavigate(action.view); onClose() }}><span><Icon size={16} /></span><span><strong>{action.label}</strong><small>{action.detail}</small></span><span className="row-arrow">-&gt;</span></button> })}{!visible.length ? <div className="palette-empty">No matching commands</div> : null}</div></div></div>
 }
 
 function Statusbar({ jobs, engineReady, rekordboxRunning, usbDevices }: { jobs: ActivityJob[]; engineReady: boolean; rekordboxRunning: boolean | null; usbDevices: UsbDevice[] }) {
@@ -1369,8 +1484,9 @@ export function App() {
   const [playlists, setPlaylists] = useState<Playlist[]>([])
   const [playlistsLoading, setPlaylistsLoading] = useState(false)
   const [jobs, setJobs] = useState<ActivityJob[]>(loadStoredJobs)
+  const [hiddenJobs, setHiddenJobs] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem("crate.hidden-jobs") || "[]") } catch { return [] } })
   const [inspector, setInspector] = useState<InspectorItem>(null)
-  const [inspectorOpen, setInspectorOpen] = useState(true)
+  const [inspectorOpen, setInspectorOpen] = useState(false)
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [rekordboxRunning, setRekordboxRunning] = useState<boolean | null>(null)
   const [engineReady, setEngineReady] = useState(false)
@@ -1379,18 +1495,20 @@ export function App() {
   const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem(THEME_KEY) as Theme) || "dark")
   const [initialUrl, setInitialUrl] = useState("")
   const [resumeJob, setResumeJob] = useState<ActivityJob | null>(null)
+  const [editorTarget, setEditorTarget] = useState<EditorTarget | null>(null)
   const toastTimers = useRef<Map<string, number>>(new Map())
 
   const showToast = useCallback((message: string, tone: ToastTone = "neutral") => {
     const id = createId("toast")
     setToasts((current) => [...current, { id, message, tone }])
-    const timer = window.setTimeout(() => setToasts((current) => current.filter((item) => item.id !== id)), 5000)
+    const timer = window.setTimeout(() => { setToasts((current) => current.filter((item) => item.id !== id)); toastTimers.current.delete(id) }, 6000)
     toastTimers.current.set(id, timer)
   }, [])
 
   const dismissToast = (id: string) => {
     const timer = toastTimers.current.get(id)
     if (timer) window.clearTimeout(timer)
+    toastTimers.current.delete(id)
     setToasts((current) => current.filter((item) => item.id !== id))
   }
 
@@ -1428,7 +1546,7 @@ export function App() {
         await loadUsbDevices()
       } catch (reason) {
         if (!canceled) {
-          setConfig(mockConfig)
+          if (!isDesktopRuntime) setConfig(mockConfig)
           showToast(reason instanceof Error ? reason.message : String(reason), "danger")
         }
       }
@@ -1463,6 +1581,8 @@ export function App() {
       }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "n") {
         event.preventDefault()
+        setEditorTarget(null)
+        setInspectorOpen(false)
         setView("import")
       }
       if (event.key === "Escape" && paletteOpen) setPaletteOpen(false)
@@ -1476,6 +1596,39 @@ export function App() {
     setJobs((current) => current.map((job) => job.id === id ? { ...job, ...(typeof update === "function" ? update(job) : update) } : job))
   }
   const inspect = (item: InspectorItem) => { setInspector(item); setInspectorOpen(true) }
+
+  const resolveProtectedTrack = async (track: JobTrack) => {
+    const source = await selectReplacementAudio()
+    if (!source) return
+    const job = jobs.find((candidate) => candidate.tracks.some((item) => item.id === track.id))
+    if (!job) throw new Error("The import job for this track is no longer available.")
+    const done = finalMessage(await runBridge("import-replacement", [], {
+      source,
+      output_dir: job.outputDir,
+      track_id: track.id,
+      title: track.title,
+    }))
+    const feature = asRecord(done.features) as unknown as TrackFeature
+    const updated: JobTrack = {
+      ...track,
+      stage: "resolved",
+      progress: 100,
+      path: asString(done.path),
+      bpm: feature.bpm,
+      key: feature.musical_key,
+      cueStatus: job.cueMode === "fill" ? "proposed" : "off",
+      error: undefined,
+    }
+    const remaining = job.tracks.filter((item) => item.stage === "protected" && item.id !== track.id).length
+    updateJob(job.id, (current) => ({
+      summary: remaining
+        ? `${remaining} protected track(s) still need source files. Retry sync after resolving them.`
+        : "All protected tracks have source files. Retry sync to finish Rekordbox import.",
+      tracks: current.tracks.map((item) => item.id === track.id ? updated : item),
+    }))
+    setInspector({ kind: "track", track: updated })
+    showToast(`${track.title} is analyzed and ready for Retry sync.`, "success")
+  }
 
   const saveConfig = async (next: AppConfig) => {
     const message = finalMessage(await runBridge("save-config", [], next as unknown as Record<string, unknown>))
@@ -1495,12 +1648,16 @@ export function App() {
   }
 
   const navigate = (next: ViewId) => {
+    setEditorTarget(null)
     setView(next)
+    setInspectorOpen(false)
     setResumeJob(null)
     if (next === "import") setInitialUrl("")
   }
 
   const openLikes = () => {
+    setEditorTarget(null)
+    setInspectorOpen(false)
     setResumeJob(null)
     setInitialUrl(config?.likes_url || "")
     setView("import")
@@ -1509,18 +1666,17 @@ export function App() {
   const consumeResumeJob = useCallback(() => setResumeJob(null), [])
 
   const openJob = (job: ActivityJob) => {
-    if (job.state === "running" || job.state === "blocked") {
+    if (job) {
       setInitialUrl("")
       setResumeJob(job)
       setView("import")
-    } else if (job.tracks[0]) {
-      inspect({ kind: "track", track: job.tracks[0] })
     }
   }
 
   const content = (() => {
-    if (view === "import") return <ImportWorkspace config={config} playlists={playlists} jobs={jobs} onCreateJob={createJob} onUpdateJob={updateJob} onInspect={inspect} initialUrl={initialUrl} resumeJob={resumeJob} onResumeJobConsumed={consumeResumeJob} onShowActivity={() => setView("activity")} rekordboxRunning={rekordboxRunning} onRekordboxStatus={setRekordboxRunning} />
-    if (view === "activity") return <ActivityView jobs={jobs} onSelectJob={openJob} onInspect={(track) => inspect({ kind: "track", track })} onClearCompleted={() => setJobs((current) => current.filter((job) => job.state === "running" || job.state === "blocked"))} />
+    if (view === "import") return null
+
+    if (view === "activity") return <ActivityView jobs={jobs.filter((job) => !hiddenJobs.includes(job.id))} onSelectJob={openJob} onClearCompleted={() => { const hidden = jobs.filter((job) => job.state === "complete").map((job) => job.id); setHiddenJobs(hidden); localStorage.setItem("crate.hidden-jobs", JSON.stringify(hidden)); showToast("Completed imports hidden. Your downloads are still in the library.") }} />
     if (view === "downloads") return <DownloadsView jobs={jobs} onInspect={(track) => inspect({ kind: "track", track })} onAddSource={() => navigate("import")} />
     if (view === "rekordbox") return <RekordboxView playlists={playlists} onReload={loadPlaylists} loading={playlistsLoading} onInspect={(playlist) => inspect({ kind: "playlist", playlist })} onToast={showToast} />
     if (view === "doctor") return <DoctorView onToast={showToast} usbDevices={usbDevices} onRekordboxStatus={setRekordboxRunning} />
@@ -1528,13 +1684,12 @@ export function App() {
   })()
 
   return (
-    <div className={`app-shell ${inspectorOpen ? "with-inspector" : ""}`}>
+    <div className={`app-shell ${inspectorOpen && inspector && !editorTarget ? "with-inspector" : ""} ${editorTarget ? "editor-mode" : ""}`}>
       <Sidebar active={view} onChange={navigate} onLikes={openLikes} jobs={jobs} config={config} />
       <div className="main-column">
-        <Topbar view={view} inspectorOpen={inspectorOpen} onToggleInspector={() => setInspectorOpen((value) => !value)} onOpenPalette={() => setPaletteOpen(true)} rekordboxRunning={rekordboxRunning} />
-        {content}
+        {editorTarget ? <TrackEditor target={editorTarget} rekordboxRunning={rekordboxRunning} onClose={() => setEditorTarget(null)} onRekordboxStatus={setRekordboxRunning} onToast={showToast} /> : <><Topbar hasSelection={Boolean(inspector)} view={view} inspectorOpen={inspectorOpen} onToggleInspector={() => setInspectorOpen((value) => !value)} onOpenPalette={() => setPaletteOpen(true)} />{content}</>}<div className="import-page" hidden={view !== "import" || Boolean(editorTarget)}>{<ImportWorkspace config={config} playlists={playlists} jobs={jobs} onCreateJob={createJob} onUpdateJob={updateJob} onInspect={inspect} initialUrl={initialUrl} resumeJob={resumeJob} onResumeJobConsumed={consumeResumeJob} onShowActivity={() => setView("activity")} rekordboxRunning={rekordboxRunning} onRekordboxStatus={setRekordboxRunning} />}</div>
       </div>
-      {inspectorOpen ? <Inspector item={inspector} onClose={() => setInspectorOpen(false)} onInspect={inspect} onOpenRekordbox={() => void openRekordboxNow()} /> : null}
+      {inspectorOpen && inspector && !editorTarget ? <Inspector item={inspector} onClose={() => setInspectorOpen(false)} onInspect={inspect} onOpenRekordbox={() => void openRekordboxNow()} onEdit={setEditorTarget} onResolveProtected={resolveProtectedTrack} /> : null}
       <Statusbar jobs={jobs} engineReady={engineReady} rekordboxRunning={rekordboxRunning} usbDevices={usbDevices} />
       {paletteOpen ? <CommandPalette onClose={() => setPaletteOpen(false)} onNavigate={navigate} /> : null}
       <Toasts items={toasts} onDismiss={dismissToast} />

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -179,6 +180,8 @@ def analyze_file(
         try:
             cached = _features_from_json(cache_file.read_text())
             if cached.analysis_version == ANALYSIS_VERSION:
+                title, artist = _tag_metadata(path)
+                cached = replace(cached, title=title or cached.title, artist=artist or cached.artist)
                 return cached
         except Exception:
             pass
@@ -186,6 +189,20 @@ def analyze_file(
     features = _analyze_uncached(path, extract_vocal_stems=extract_vocal_stems)
     cache_file.write_text(json.dumps(_features_to_dict(features), indent=2) + "\n")
     return features
+
+
+def analysis_cache_path(features: TrackFeatures, *, output_dir: Path | None = None) -> Path:
+    path = Path(features.path).expanduser().resolve()
+    return analysis_dir(output_dir or path.parent) / f"{_cache_key(path)}.json"
+
+
+def save_analysis_features(features: TrackFeatures, *, output_dir: Path | None = None) -> Path:
+    """Persist an effective analysis after a reviewed manual correction."""
+    cache_file = analysis_cache_path(features, output_dir=output_dir)
+    temporary = cache_file.with_name(f".{cache_file.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(_features_to_dict(features), indent=2) + "\n")
+    os.replace(temporary, cache_file)
+    return cache_file
 
 
 def write_id3_tags(path: Path, features: TrackFeatures) -> None:
@@ -263,17 +280,49 @@ class _FeatureBundle:
     beat_phase_confidence: float
 
 
+def _audio_info(path: Path) -> tuple[float, int]:
+    if path.suffix.lower() == ".mp3":
+        from mutagen.mp3 import MP3
+
+        info = MP3(path).info
+        return float(info.length), int(info.sample_rate)
+    info = sf.info(str(path))
+    return float(info.duration), int(info.samplerate)
+
+
+def _load_analysis_audio(path: Path, *, duration: float | None, offset: float = 0.0):
+    if path.suffix.lower() != ".mp3":
+        import librosa
+
+        return librosa.load(str(path), sr=22050, mono=True, offset=offset, duration=duration)
+
+    # The bundled libsndfile MPEG decoder can crash inside mpeg_init when
+    # multiple tracks open concurrently. Decode MP3s in an isolated FFmpeg
+    # process, so decoder failures become reportable errors, not worker crashes.
+    from imageio_ffmpeg import get_ffmpeg_exe
+
+    command = [get_ffmpeg_exe(), "-nostdin", "-v", "error", "-ss", str(offset), "-i", str(path)]
+    if duration is not None:
+        command.extend(["-t", str(duration)])
+    command.extend(["-vn", "-ac", "1", "-ar", "22050", "-f", "f32le", "pipe:1"])
+    result = subprocess.run(command, capture_output=True, timeout=120, check=False)
+    if result.returncode:
+        raise RuntimeError(f"MP3 decoding failed for {path.name}: {result.stderr.decode(errors='replace').strip()}")
+    return np.frombuffer(result.stdout, dtype="<f4").copy(), 22050
+
+
 def _analyze_uncached(path: Path, *, extract_vocal_stems: bool = False) -> TrackFeatures:
     import librosa
 
-    title, artist = _title_artist_from_filename(path)
+    fallback_title, fallback_artist = _title_artist_from_filename(path)
+    tag_title, tag_artist = _tag_metadata(path)
+    title, artist = tag_title or fallback_title, tag_artist or fallback_artist
     source_id = _source_id_from_filename(path)
-    file_info = sf.info(str(path))
-    full_duration = float(file_info.duration)
+    full_duration, source_sample_rate = _audio_info(path)
     # 480s = 8 minutes covers radio edits, club edits, and most extended mixes.
     # Truly long progressive tracks (>8min) still get the full first 8 min.
     analysis_duration = min(full_duration, 480.0) if full_duration > 0 else None
-    y, sr = librosa.load(str(path), sr=22050, mono=True, duration=analysis_duration)
+    y, sr = _load_analysis_audio(path, duration=analysis_duration)
     if y.size == 0:
         raise ValueError(f"empty audio file: {path}")
 
@@ -331,7 +380,7 @@ def _analyze_uncached(path: Path, *, extract_vocal_stems: bool = False) -> Track
         title=title,
         artist=artist,
         duration_sec=round(duration, 3),
-        sample_rate=int(file_info.samplerate or sr),
+        sample_rate=int(source_sample_rate or sr),
         bpm=round(float(bundle.tempo), 3),
         musical_key=musical_key,
         camelot_key=camelot,
@@ -699,7 +748,7 @@ def _build_loop_profile_from_bundle(
     if tail_offset <= bundle.duration_analysis + 5.0:
         return base
     try:
-        y_tail, sr_tail = librosa.load(str(path), sr=22050, mono=True, offset=tail_offset, duration=tail_window)
+        y_tail, sr_tail = _load_analysis_audio(path, offset=tail_offset, duration=tail_window)
     except Exception:
         return base
     if y_tail.size == 0:
@@ -2196,6 +2245,19 @@ def _amp_to_db(value: float) -> float:
     if value <= 0:
         return -120.0
     return 20.0 * math.log10(value)
+
+
+def _tag_metadata(path: Path) -> tuple[str, str]:
+    from mutagen import File, MutagenError
+    from mutagen.easyid3 import EasyID3
+
+    try:
+        tags = EasyID3(path) if path.suffix.lower() == ".mp3" else File(path, easy=True)
+        if tags is None:
+            return "", ""
+        return str((tags.get("title") or [""])[0]), ", ".join(tags.get("artist") or [])
+    except (OSError, MutagenError):
+        return "", ""
 
 
 def _title_artist_from_filename(path: Path) -> tuple[str, str]:

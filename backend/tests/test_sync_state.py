@@ -30,12 +30,14 @@ def test_state_round_trip():
     state.title = "test"
     state.target_dir = "/tmp/foo"
     state.track_ids = ["1", "2", "3"]
+    state.protected_ids = ["4"]
     state.rekordbox_playlist = "test"
     sync_state.save_state(state)
 
     reloaded = sync_state.load_state(url)
     assert reloaded.title == "test"
     assert reloaded.track_ids == ["1", "2", "3"]
+    assert reloaded.protected_ids == ["4"]
     assert reloaded.rekordbox_playlist == "test"
 
 

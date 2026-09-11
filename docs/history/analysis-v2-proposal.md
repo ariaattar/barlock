@@ -1,3 +1,5 @@
+> Historical proposal. This document is retained for context; see the root README and current architecture for maintained behavior.
+
 # Analysis v2: Top-Tier Cue Generation
 
 **Cue quality is the product.** Everything else in this document — structure, energy, vocals, stems, sparklines — exists in service of placing cues that are *correct on every track, every time*, with conservative behavior when the analyzer is unsure. A wrong cue is worse than a missing cue. A great cue is worth ten good features.

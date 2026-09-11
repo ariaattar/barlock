@@ -2,7 +2,7 @@
   "lockfileVersion": 1,
   "workspaces": {
     "": {
-      "name": "soundcloud-dl-tui",
+      "name": "crate-tui",
       "dependencies": {
         "@opentui/core": "^0.4.2",
       },

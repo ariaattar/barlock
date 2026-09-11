@@ -1,0 +1,49 @@
+/* Crate identity and source entry. Audio graphics here are decorative sleeve art. */
+.brand-mark svg { width: 29px; height: 29px; }
+.brand-period { color: #a4b5ff; }
+.brand-lockup > div:last-child > span { font-size: 10px; margin-top: 3px; letter-spacing: -.1px; }
+.import-page { display: flex; flex: 1; min-height: 0; }
+.import-page[hidden] { display: none; }
+.import-source-label { margin-top: 40px; color: var(--text-secondary); font-size: 12px; font-weight: 550; }
+.import-intro .url-command, .import-intro .import-source-label, .import-intro .inline-error, .import-intro .resolving-line { position: relative; width: calc(100% + 200px); }
+.import-art { position: absolute; right: 12px; top: 0; width: 166px; height: 174px; pointer-events: none; }
+.record-sleeve { position: absolute; width: 140px; height: 152px; border-radius: 3px; border: 1px solid #ffffff20; }
+.sleeve-back { left: 20px; top: 0; transform: rotate(9deg); background: #a4b5ff; box-shadow: 0 10px 24px #0003; }
+.sleeve-front { top: 14px; left: 0; transform: rotate(-7deg); display: flex; flex-direction: column; padding: 10px; background: #25272e; color: #ececf2; box-shadow: 0 10px 24px #0004; }
+.sleeve-front > span { font-size: 8px; letter-spacing: 1px; font-weight: 650; }
+.sleeve-front > small { margin-top: auto; font-size: 6px; letter-spacing: .7px; }
+.vinyl-disc { display: grid; width: 102px; height: 102px; place-items: center; margin: 6px auto; border-radius: 50%; background: repeating-radial-gradient(circle, #19191c 0px, #19191c 2px, #333339 3px, #19191c 4px); box-shadow: inset 0 0 0 1px #ffffff12; }
+.vinyl-disc i { width: 28px; height: 28px; border: 12px solid #a4b5ff; border-radius: 50%; background: #19191c; }
+.sort-select { appearance: none; padding-right: 28px; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='m3 4 3 3 3-3' stroke='%23929299' fill='none'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; min-height: 40px; border: 1px solid var(--separator); border-radius: 7px; background-color: var(--surface-1); padding-left: 12px; font-size: 12px; }
+.library-toolbar { gap: 12px; }
+.library-toolbar .search-field { flex: 1; }
+.track-table-row:focus-visible { outline-offset: -2px; background: var(--surface-2); }
+.row-error-detail { position: static; grid-column: 2 / -1; white-space: normal; line-height: 1.5; padding-bottom: 3px; }
+.job-progress-panel.is-complete { background: transparent; box-shadow: none; padding: 16px 0; border-top: 1px solid var(--separator); border-bottom: 1px solid var(--separator); }
+.local-waveform-placeholder { display: flex; min-height: 150px; flex-direction: column; gap: 12px; align-items: center; justify-content: center; text-align: center; padding: 20px; background: var(--surface-2); border-radius: 8px; color: var(--text-secondary); font-size: 13px; }
+.local-waveform-placeholder small { color: var(--text-tertiary); font-size: 12px; line-height: 1.5; }
+.palette button.selected { background: var(--surface-3); }
+.palette-hint { padding: 12px 18px; border-top: 1px solid var(--separator); color: var(--text-tertiary); font-size: 12px; display: flex; gap: 16px; }
+.settings-section-title p, .settings-fields small { line-height: 1.6; }
+.playlist-actions .icon-button { opacity: .35; }
+.playlist-row:hover .playlist-actions .icon-button, .playlist-actions .icon-button:focus-visible { opacity: 1; }
+@media (max-width: 1150px) {
+  .import-art { transform: scale(.8); transform-origin: top right; }
+  .import-intro { padding-right: 160px; }
+  .import-intro .url-command, .import-intro .import-source-label, .import-intro .inline-error, .import-intro .resolving-line { width: calc(100% + 160px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+}
+
+.playlist-cover-type { position: absolute; bottom: 14px; left: 16px; font-family: "Geist Mono", monospace; font-size: 10px; letter-spacing: 1.4px; color: var(--text-secondary); }
+.import-workspace.has-plan { padding-top: 28px; }
+.has-plan .import-intro { padding-right: 0; padding-bottom: 24px; }
+.has-plan .import-intro .url-command { width: 100%; }
+.has-plan .import-art, .has-plan .eyebrow, .has-plan .import-intro > p, .has-plan .import-source-label { display: none; }
+.has-plan .import-intro h1 { font-size: 30px; letter-spacing: -.8px; }
+.source-track-title { display: flex; flex-direction: column; gap: 4px; }
+.source-track-title strong { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
+.source-track-title small { font-size: 12px; color: var(--text-tertiary); }
+.source-track-row { min-height: 56px; }
+.import-actionbar { position: sticky; bottom: 0; z-index: 2; background: var(--canvas); padding: 16px 0; }

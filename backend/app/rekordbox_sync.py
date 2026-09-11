@@ -6,7 +6,7 @@ import plistlib
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -179,6 +179,17 @@ class PlaylistTrack:
 
 
 @dataclass(frozen=True)
+class RekordboxTrackInfo:
+    content_id: str
+    title: str
+    artist: str
+    folder_path: str
+    file_exists: bool
+    soundcloud_dl_managed: bool
+    musical_key: str
+
+
+@dataclass(frozen=True)
 class GeneratedActiveLoop:
     cue_id: str
     content_id: str
@@ -229,6 +240,12 @@ class RekordboxWaveformLane:
     tag: str
     heights: list[float]
     colors: list[list[int]]
+    style: str = "rgb"
+    sample_rate_hz: float | None = None
+    source_points: int = 0
+    bands: dict[str, list[float]] = field(default_factory=dict)
+    back_heights: list[float] = field(default_factory=list)
+    back_colors: list[list[int]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -301,9 +318,41 @@ def list_playlist_tracks(playlist_id: str) -> list[PlaylistTrack]:
         db.close()
 
 
+def rekordbox_track(content_id: str) -> RekordboxTrackInfo:
+    db = Rekordbox6Database()
+    try:
+        content = db.get_content(ID=content_id)
+        if content is None:
+            raise ValueError(f"track not found: {content_id}")
+        path = str(content.FolderPath or "")
+        artist = ""
+        musical_key = ""
+        try:
+            if content.Artist is not None:
+                artist = str(content.Artist.Name or "")
+        except Exception:
+            pass
+        try:
+            if content.Key is not None:
+                musical_key = str(content.Key.ScaleName or "")
+        except Exception:
+            pass
+        return RekordboxTrackInfo(
+            content_id=str(content.ID),
+            title=str(content.Title or Path(path).stem or ""),
+            artist=artist,
+            folder_path=path,
+            file_exists=bool(path) and Path(path).exists(),
+            soundcloud_dl_managed=_is_soundcloud_dl_content(content),
+            musical_key=musical_key,
+        )
+    finally:
+        db.close()
+
+
 def rekordbox_waveform(content_id: str, *, max_points: int = 2400) -> RekordboxWaveform:
-    if max_points < 100 or max_points > 12000:
-        raise ValueError("max_points must be between 100 and 12000")
+    if max_points < 100 or max_points > 180000:
+        raise ValueError("max_points must be between 100 and 180000")
 
     db = Rekordbox6Database()
     try:
@@ -330,7 +379,7 @@ def rekordbox_waveform(content_id: str, *, max_points: int = 2400) -> RekordboxW
                     "size": stat.st_size,
                 }
             )
-            for tag_name in ("PQTZ", "PWAV", "PWV3", "PWV4", "PWV5"):
+            for tag_name in ("PQTZ", "PWAV", "PWV3", "PWV4", "PWV5", "PWV6", "PWV7"):
                 if tag_name in anlz and tag_name not in tags:
                     tags[tag_name] = anlz.get_tag(tag_name)
 
@@ -347,11 +396,11 @@ def rekordbox_waveform(content_id: str, *, max_points: int = 2400) -> RekordboxW
                 )
 
         preview = _rekordbox_waveform_lane(
-            tags.get("PWV4") or tags.get("PWAV"),
+            tags.get("PWV6") or tags.get("PWV4") or tags.get("PWAV"),
             max_points=min(max_points, 1200),
         )
         detail = _rekordbox_waveform_lane(
-            tags.get("PWV5") or tags.get("PWV3"),
+            tags.get("PWV7") or tags.get("PWV5") or tags.get("PWV3"),
             max_points=max_points,
         )
 
@@ -371,6 +420,8 @@ def rekordbox_waveform(content_id: str, *, max_points: int = 2400) -> RekordboxW
         ]
 
         duration = float(getattr(content, "Length", 0) or 0)
+        if detail is not None and detail.sample_rate_hz and detail.source_points:
+            duration = detail.source_points / detail.sample_rate_hz
         if duration <= 0 and beat_grid:
             duration = beat_grid[-1].time_sec
         return RekordboxWaveform(
@@ -393,21 +444,37 @@ def _rekordbox_waveform_lane(tag, *, max_points: int) -> RekordboxWaveformLane |
     if tag is None:
         return None
 
-    raw = tag.get()
     tag_type = str(tag.type)
+    if tag_type in {"PWV6", "PWV7"}:
+        return _rekordbox_three_band_lane(tag, max_points=max_points)
+
+    raw = tag.get()
     heights: list[float]
     colors: list[list[int]]
+    back_heights: list[float] = []
+    back_colors: list[list[int]] = []
+    sample_rate_hz = 150.0 if tag_type in {"PWV3", "PWV5"} else None
     if tag_type == "PWV5":
         raw_heights, raw_colors = raw
         heights = [max(0.0, min(1.0, float(value))) for value in raw_heights]
         colors = [
-            [int(round(max(0, min(7, int(channel))) / 7.0 * 255.0)) for channel in color]
+            [
+                int(round(max(0, min(7, int(color[0]))) / 7.0 * 255.0)),
+                int(round(max(0, min(7, int(color[2]))) / 7.0 * 255.0)),
+                int(round(max(0, min(7, int(color[1]))) / 7.0 * 255.0)),
+            ]
             for color in raw_colors
         ]
     elif tag_type == "PWV4":
         raw_heights, raw_colors, _ = raw
-        heights = [max(0.0, min(1.0, float(value[0]) / 127.0)) for value in raw_heights]
+        maximum = max((float(value[1]) for value in raw_heights), default=127.0) or 127.0
+        heights = [max(0.0, min(1.0, float(value[0]) / maximum)) for value in raw_heights]
+        back_heights = [max(0.0, min(1.0, float(value[1]) / maximum)) for value in raw_heights]
         colors = [
+            [max(0, min(255, int(round(channel)))) for channel in color[1]]
+            for color in raw_colors
+        ]
+        back_colors = [
             [max(0, min(255, int(round(channel)))) for channel in color[0]]
             for color in raw_colors
         ]
@@ -419,12 +486,90 @@ def _rekordbox_waveform_lane(tag, *, max_points: int) -> RekordboxWaveformLane |
             brightness = int(round(92 + max(0, min(7, int(value))) / 7.0 * 130))
             colors.append([42, min(255, brightness + 25), min(255, brightness + 58)])
 
+    source_points = len(heights)
     sampled_heights, sampled_colors = _downsample_waveform(heights, colors, max_points=max_points)
+    if back_heights:
+        sampled_back_heights, sampled_back_colors = _downsample_waveform(
+            back_heights,
+            back_colors,
+            max_points=max_points,
+        )
+    else:
+        sampled_back_heights, sampled_back_colors = [], []
     return RekordboxWaveformLane(
         tag=tag_type,
         heights=[round(value, 4) for value in sampled_heights],
         colors=sampled_colors,
+        style="rgb" if tag_type in {"PWV4", "PWV5"} else "blue",
+        sample_rate_hz=sample_rate_hz,
+        source_points=source_points,
+        back_heights=[round(value, 4) for value in sampled_back_heights],
+        back_colors=sampled_back_colors,
     )
+
+
+def _rekordbox_three_band_lane(tag, *, max_points: int) -> RekordboxWaveformLane | None:
+    content = tag.content
+    entries = bytes(content.entries)
+    source_points = min(int(content.len_entries), len(entries) // 3)
+    if source_points <= 0:
+        return None
+
+    mid = [float(entries[index * 3]) for index in range(source_points)]
+    high = [float(entries[index * 3 + 1]) for index in range(source_points)]
+    low = [float(entries[index * 3 + 2]) for index in range(source_points)]
+    low, mid, high = _downsample_three_band(low, mid, high, max_points=max_points)
+
+    if str(tag.type) == "PWV6":
+        display_heights = [
+            low_value * 0.49 + mid_value * 0.32 + high_value * 0.25
+            for low_value, mid_value, high_value in zip(low, mid, high)
+        ]
+        maximum = max(display_heights, default=1.0) or 1.0
+        heights = [round(value / maximum, 4) for value in display_heights]
+        sample_rate_hz = None
+    else:
+        display_heights = [
+            max(low_value * 0.4, mid_value * 0.3, high_value * 0.06)
+            for low_value, mid_value, high_value in zip(low, mid, high)
+        ]
+        heights = [round(min(1.0, value / 51.0), 4) for value in display_heights]
+        sample_rate_hz = 150.0
+
+    return RekordboxWaveformLane(
+        tag=str(tag.type),
+        heights=heights,
+        colors=[],
+        style="three_band",
+        sample_rate_hz=sample_rate_hz,
+        source_points=source_points,
+        bands={
+            "low": [round(value, 3) for value in low],
+            "mid": [round(value, 3) for value in mid],
+            "high": [round(value, 3) for value in high],
+        },
+    )
+
+
+def _downsample_three_band(
+    low: list[float],
+    mid: list[float],
+    high: list[float],
+    *,
+    max_points: int,
+) -> tuple[list[float], list[float], list[float]]:
+    if len(low) <= max_points:
+        return low, mid, high
+
+    sampled = ([], [], [])
+    for output_index in range(max_points):
+        start = output_index * len(low) // max_points
+        end = max(start + 1, (output_index + 1) * len(low) // max_points)
+        count = end - start
+        sampled[0].append(sum(low[start:end]) / count)
+        sampled[1].append(sum(mid[start:end]) / count)
+        sampled[2].append(sum(high[start:end]) / count)
+    return sampled
 
 
 def _rekordbox_cue_out_seconds(value: object | None) -> float | None:

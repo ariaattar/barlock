@@ -1,5 +1,5 @@
 [project]
-name = "soundcloud-rekordbox-dl"
+name = "crate-engine"
 version = "0.1.0"
 description = "Interactive SoundCloud downloader, analyzer, and Rekordbox playlist importer"
 requires-python = ">=3.10,<3.13"

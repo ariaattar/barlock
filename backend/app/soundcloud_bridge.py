@@ -5,12 +5,23 @@ import json
 import os
 import sys
 import threading
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Callable
 
 from .audio_features import TrackFeatures, analyze_file, analyze_one_worker, audio_files, write_id3_tags
+from .editor_service import (
+    adopt_cues,
+    apply_draft,
+    load_editor,
+    prepare_audition,
+    preview_apply,
+    rebase_draft,
+    reset_draft,
+    save_draft,
+)
 from .rekordbox_sync import (
     close_rekordbox,
     doctor,
@@ -38,6 +49,7 @@ from .soundcloud_downloader import (
     DownloadResult,
     SoundCloudDownloadError,
     collect_download_plan,
+    import_local_replacement,
     download_entries,
     paths_for_entries,
 )
@@ -88,6 +100,10 @@ def build_parser() -> argparse.ArgumentParser:
     download_parser.add_argument("--limit", type=int)
     download_parser.add_argument("--ffmpeg")
     download_parser.set_defaults(handler=_cmd_download)
+
+    replacement_parser = subparsers.add_parser("import-replacement")
+    replacement_parser.add_argument("--payload", default="-")
+    replacement_parser.set_defaults(handler=_cmd_import_replacement)
 
     analyze_parser = subparsers.add_parser("analyze")
     analyze_parser.add_argument("paths", nargs="*")
@@ -151,11 +167,71 @@ def build_parser() -> argparse.ArgumentParser:
     reanalyze_parser.add_argument("--payload", default="-")
     reanalyze_parser.set_defaults(handler=_cmd_reanalyze_playlist)
 
+    editor_load_parser = subparsers.add_parser("editor-load")
+    editor_load_parser.add_argument("--payload", default="-")
+    editor_load_parser.set_defaults(handler=_cmd_editor_load)
+
+    editor_save_parser = subparsers.add_parser("editor-save-draft")
+    editor_save_parser.add_argument("--payload", default="-")
+    editor_save_parser.set_defaults(handler=_cmd_editor_save_draft)
+
+    editor_audition_parser = subparsers.add_parser("editor-prepare-audition")
+    editor_audition_parser.add_argument("--payload", default="-")
+    editor_audition_parser.set_defaults(handler=_cmd_editor_prepare_audition)
+
+    editor_preview_parser = subparsers.add_parser("editor-preview-apply")
+    editor_preview_parser.add_argument("--payload", default="-")
+    editor_preview_parser.set_defaults(handler=_cmd_editor_preview_apply)
+
+    editor_apply_parser = subparsers.add_parser("editor-apply")
+    editor_apply_parser.add_argument("--payload", default="-")
+    editor_apply_parser.set_defaults(handler=_cmd_editor_apply)
+
+    editor_adopt_parser = subparsers.add_parser("editor-adopt-cues")
+    editor_adopt_parser.add_argument("--payload", default="-")
+    editor_adopt_parser.set_defaults(handler=_cmd_editor_adopt_cues)
+
+    editor_reset_parser = subparsers.add_parser("editor-reset-auto")
+    editor_reset_parser.add_argument("--payload", default="-")
+    editor_reset_parser.set_defaults(handler=_cmd_editor_reset_auto)
+
+    editor_rebase_parser = subparsers.add_parser("editor-rebase")
+    editor_rebase_parser.add_argument("--payload", default="-")
+    editor_rebase_parser.set_defaults(handler=_cmd_editor_rebase)
+
     return parser
 
 
 def _default_analyze_workers() -> int:
     return max(1, min(os.cpu_count() or 4, 4))
+
+
+def _packaged_runtime() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def _analyze_paths_serial(
+    paths: list[Path],
+    *,
+    output_dir: Path | None,
+    extract_vocal_stems: bool,
+    use_cache: bool,
+) -> list[TrackFeatures]:
+    results: list[TrackFeatures] = []
+    for index, path in enumerate(paths, start=1):
+        _emit(
+            "status",
+            message=f"[{index}/{len(paths)}] analyzing {path.name}",
+        )
+        results.append(
+            analyze_file(
+                path,
+                output_dir=output_dir or path.parent,
+                use_cache=use_cache,
+                extract_vocal_stems=extract_vocal_stems,
+            )
+        )
+    return results
 
 
 def _analyze_paths_parallel(
@@ -168,9 +244,9 @@ def _analyze_paths_parallel(
 ) -> list[TrackFeatures]:
     """Analyze N audio paths concurrently, preserving input order.
 
-    Workers run in a ProcessPoolExecutor — each worker imports librosa once
-    on first task. For small batches we fall back to in-process serial work
-    so we don't pay the worker startup cost.
+    Source runs use processes so CPU-heavy feature extraction can scale across
+    cores. Frozen desktop builds use a small thread pool because spawning the
+    bundled NumPy runtime is unstable on macOS. Small batches stay serial.
     """
     if not paths:
         return []
@@ -178,23 +254,19 @@ def _analyze_paths_parallel(
     worker_count = workers if workers is not None else _default_analyze_workers()
     worker_count = max(1, min(worker_count, len(paths)))
 
-    # For tiny batches the spawn cost dwarfs the parallel savings.
+    # For tiny batches the executor overhead dwarfs the parallel savings.
     if worker_count == 1 or len(paths) < 3:
-        results: list[TrackFeatures] = []
-        for index, path in enumerate(paths, start=1):
-            _emit(
-                "status",
-                message=f"[{index}/{len(paths)}] analyzing {path.name}",
-            )
-            results.append(
-                analyze_file(
-                    path,
-                    output_dir=output_dir or path.parent,
-                    use_cache=use_cache,
-                    extract_vocal_stems=extract_vocal_stems,
-                )
-            )
-        return results
+        return _analyze_paths_serial(
+            paths,
+            output_dir=output_dir,
+            extract_vocal_stems=extract_vocal_stems,
+            use_cache=use_cache,
+        )
+
+    packaged = _packaged_runtime()
+    executor_type = ThreadPoolExecutor if packaged else ProcessPoolExecutor
+    if packaged:
+        worker_count = min(worker_count, 2)
 
     total = len(paths)
     output_dir_str = str(output_dir) if output_dir is not None else ""
@@ -203,36 +275,47 @@ def _analyze_paths_parallel(
         for path in paths
     ]
     results_by_index: dict[int, TrackFeatures] = {}
-    started: set[int] = set()
     finished = 0
     lock = threading.Lock()
 
     def emit_progress(track_name: str = "") -> None:
         with lock:
-            in_progress = len(started) - finished
             tail = f" ({track_name})" if track_name else ""
             _emit(
                 "status",
-                message=f"[{finished}/{total} done, {max(in_progress, 0)} in progress] analyzing{tail}",
+                message=f"[{finished}/{total} done] analyzing{tail}",
             )
 
-    with ProcessPoolExecutor(max_workers=worker_count) as executor:
-        futures = {}
-        for index, item in enumerate(work_items):
-            future = executor.submit(analyze_one_worker, item)
-            futures[future] = (index, Path(item[0]).name)
-            started.add(index)
-        emit_progress()
-        for future in as_completed(futures):
-            index, name = futures[future]
-            try:
-                features = future.result()
-            except Exception as exc:
-                raise RuntimeError(f"analysis failed for {name}: {exc}") from exc
-            results_by_index[index] = features
-            with lock:
-                finished += 1
-            emit_progress(name)
+    try:
+        with executor_type(max_workers=worker_count) as executor:
+            futures = {}
+            for index, item in enumerate(work_items):
+                future = executor.submit(analyze_one_worker, item)
+                futures[future] = (index, Path(item[0]).name)
+            emit_progress()
+            for future in as_completed(futures):
+                index, name = futures[future]
+                try:
+                    features = future.result()
+                except BrokenProcessPool:
+                    raise
+                except Exception as exc:
+                    raise RuntimeError(f"analysis failed for {name}: {exc}") from exc
+                results_by_index[index] = features
+                with lock:
+                    finished += 1
+                emit_progress(name)
+    except BrokenProcessPool:
+        _emit(
+            "status",
+            message="Parallel analyzer stopped unexpectedly; retrying safely...",
+        )
+        return _analyze_paths_serial(
+            paths,
+            output_dir=output_dir,
+            extract_vocal_stems=extract_vocal_stems,
+            use_cache=use_cache,
+        )
 
     return [results_by_index[i] for i in range(total)]
 
@@ -330,6 +413,7 @@ def _cmd_download(args: argparse.Namespace) -> int:
         paths=[str(path) for path in paths],
         downloaded_paths=[str(path) for path in downloaded_paths],
         failures=[_result_error_to_dict(result) for result in failed],
+        download_outcomes=[_download_outcome_to_dict(result) for result in results],
     )
     return 0 if paths else 1
 
@@ -363,6 +447,31 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         count=len(features),
         features=[features_to_dict(item) for item in features],
     )
+    return 0
+
+
+def _cmd_import_replacement(args: argparse.Namespace) -> int:
+    payload = _load_payload(args.payload)
+    source_value = str(payload.get("source") or "").strip()
+    output_value = str(payload.get("output_dir") or "").strip()
+    if not source_value or not output_value:
+        raise ValueError("payload.source and payload.output_dir are required")
+    output_dir = Path(output_value)
+    path = import_local_replacement(
+        Path(source_value),
+        output_dir=output_dir,
+        track_id=str(payload.get("track_id") or ""),
+        title=str(payload.get("title") or "SoundCloud track"),
+    )
+    _emit("status", message=f"Analyzing replacement {path.name}")
+    config = load_config()
+    features = analyze_file(
+        path,
+        output_dir=output_dir,
+        extract_vocal_stems=config.extract_vocal_stems,
+    )
+    write_id3_tags(path, features)
+    _emit("done", ok=True, path=str(path), features=features_to_dict(features))
     return 0
 
 
@@ -579,18 +688,33 @@ def _calibration_delta(expected: dict[str, Any], features: TrackFeatures, *, dro
     return delta
 
 
+def _sync_diff(state: SyncState, entries: list[DownloadEntry], target_dir: Path):
+    current_ids = [entry.id for entry in entries if entry.id]
+    current_id_set = set(current_ids)
+    local_ids = {
+        entry.id for entry in entries
+        if entry.id and paths_for_entries(target_dir, [entry])
+    }
+    # Retain upstream removals in history, but retry current tracks whose local
+    # files were deleted or are absent from a newly selected destination.
+    known_ids = [
+        track_id for track_id in state.track_ids
+        if track_id not in current_id_set or track_id in local_ids
+    ]
+    return diff_track_ids(known_ids, current_ids)
+
+
 def _cmd_sync_plan(args: argparse.Namespace) -> int:
     url = args.url.strip()
     if not url:
         raise ValueError("url is required")
     state = load_state(url)
     _emit("status", message="Expanding SoundCloud playlist...")
-    plan = collect_download_plan([url])
+    plan = collect_download_plan([url], status=lambda message: _emit("status", message=message))
     entries = plan.entries
-    current_ids = [entry.id for entry in entries if entry.id]
-    diff = diff_track_ids(state.track_ids, current_ids)
     title = plan.title or state.title or "SoundCloud"
     target_dir = Path(state.target_dir) if state.target_dir else derive_target_dir(title)
+    diff = _sync_diff(state, entries, target_dir)
     suggested_playlist = state.rekordbox_playlist or title
     _print_json(
         {
@@ -604,7 +728,7 @@ def _cmd_sync_plan(args: argparse.Namespace) -> int:
             "added": [_entry_to_dict(entry) for entry in entries if entry.id in set(diff.added_ids)],
             "removed_ids": diff.removed_ids,
             "unchanged_count": len(diff.unchanged_ids),
-            "is_first_sync": not bool(state.track_ids),
+            "is_first_sync": not bool(state.track_ids or state.protected_ids),
             "entries": [_entry_to_dict(entry) for entry in entries],
         }
     )
@@ -631,7 +755,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     state = load_state(url)
 
     _emit("status", message="Expanding SoundCloud playlist...")
-    plan = collect_download_plan([url])
+    plan = collect_download_plan([url], status=lambda message: _emit("status", message=message))
     entries = plan.entries
     title = plan.title or state.title or "SoundCloud"
     if target_dir_override:
@@ -645,22 +769,32 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     archive = target_dir / f".{safe_slug(title)}.archive.txt"
 
     current_ids = [entry.id for entry in entries if entry.id]
-    diff = diff_track_ids(state.track_ids, current_ids)
+    diff = _sync_diff(state, entries, target_dir)
     _emit(
         "plan",
         title=title,
         target_dir=str(target_dir),
         total=len(entries),
         added=len(diff.added_ids),
-        removed=len(diff.removed_ids),
+        removed=0,
+        retained=len(diff.removed_ids),
         unchanged=len(diff.unchanged_ids),
     )
 
-    new_entries = [entry for entry in entries if entry.id in set(diff.added_ids)]
+    candidate_new_entries = [entry for entry in entries if entry.id in set(diff.added_ids)]
+    new_entries = [
+        entry for entry in candidate_new_entries
+        if not paths_for_entries(target_dir, [entry])
+    ]
+    existing_new_count = len(candidate_new_entries) - len(new_entries)
+    if existing_new_count:
+        _emit("status", message=f"Using {existing_new_count} existing replacement file(s).")
     downloaded_paths: list[Path] = []
+    download_results: list[DownloadResult] = []
     failed_downloads: list[dict[str, str]] = []
+    protected_ids = set(state.protected_ids)
     if new_entries:
-        results = download_entries(
+        download_results = download_entries(
             new_entries,
             output_dir=target_dir,
             workers=config.workers,
@@ -669,7 +803,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
             archive=archive,
             status=lambda message: _emit("status", message=message),
         )
-        for result in results:
+        for result in download_results:
             if result.ok:
                 downloaded_paths.extend(result.output_paths)
             else:
@@ -679,8 +813,11 @@ def _cmd_sync(args: argparse.Namespace) -> int:
                         "title": result.entry.label,
                         "url": result.entry.url,
                         "error": result.error or "unknown",
+                        "reason": result.reason or "download",
                     }
                 )
+                if result.reason == "protected" and result.entry.id:
+                    protected_ids.add(result.entry.id)
         if failed_downloads:
             _emit(
                 "status",
@@ -694,15 +831,21 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     else:
         _emit("status", message="No new tracks to download.")
 
+    # Persist download evidence in the UI before native analysis can fail.
+    _emit("download-results", download_outcomes=[
+        _download_outcome_to_dict(result) for result in download_results
+    ])
+
     # Paths covered by the playlist now = current SoundCloud entries' MP3s present on disk
     current_paths = sorted(set(paths_for_entries(target_dir, entries)))
     # Successfully-tracked IDs are the ones we have an MP3 for. Failed downloads are
     # excluded so the next sync retries them instead of treating them as synced.
     tracked_ids = _ids_from_paths(current_paths)
-    # Resolve removed track MP3 paths (best-effort: look for any local file with [id] suffix)
-    removed_paths = _resolve_removed_paths(target_dir, diff.removed_ids)
+    tracked_id_set = set(tracked_ids)
+    if diff.removed_ids:
+        _emit("status", message=f"Keeping {len(diff.removed_ids)} previously saved track(s) no longer listed on SoundCloud.")
 
-    url_by_id = {entry.id: entry.url for entry in entries if entry.id}
+    entry_by_id = {entry.id: entry for entry in entries if entry.id}
     features: list[TrackFeatures] = []
     if (do_analyze or do_push) and current_paths:
         _emit("status", message=f"Analyzing {len(current_paths)} track(s)...")
@@ -712,9 +855,17 @@ def _cmd_sync(args: argparse.Namespace) -> int:
             extract_vocal_stems=config.extract_vocal_stems,
         )
         for item in raw_features:
-            source_url = url_by_id.get(item.source_id, item.source_url)
+            entry = entry_by_id.get(item.source_id)
+            source_url = entry.url if entry else item.source_url
             if source_url:
                 item = replace(item, source_url=source_url)
+            if entry:
+                # Repair numeric titles left by older fallback downloads
+                # without changing meaningful existing titles.
+                if entry.title and (not item.title or item.title == entry.id):
+                    item = replace(item, title=entry.title, artist=entry.artist or item.artist)
+                elif entry.artist and not item.artist:
+                    item = replace(item, artist=entry.artist)
             features.append(item)
 
     if do_tags and features:
@@ -722,7 +873,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
             write_id3_tags(Path(item.path), item)
 
     push_summary: dict[str, Any] = {}
-    if do_push:
+    if do_push and features:
         if rekordbox_running():
             raise RuntimeError("Close Rekordbox before sync so the playlist can be updated.")
         playlist_name = playlist_name_override or state.rekordbox_playlist or title
@@ -732,7 +883,6 @@ def _cmd_sync(args: argparse.Namespace) -> int:
             playlist_name=playlist_name,
             playlist_id=playlist_id,
             create_playlist=True,
-            remove_paths=[str(p) for p in removed_paths],
             cue_mode=cue_mode,
         )
         push_summary = {
@@ -753,12 +903,16 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         state.rekordbox_playlist_id = result.playlist_id
 
     # Update sync state regardless of push (so deltas track correctly next time).
-    # Only persist IDs we actually have an MP3 for — failed downloads must be
-    # retried on the next sync, not silently treated as synced.
+    # Keep previously downloaded IDs even after an unlike or takedown. Add only
+    # successful local downloads, so new failures remain retryable.
     state.url = url
     state.title = title
     state.target_dir = str(target_dir)
-    state.track_ids = tracked_ids
+    state.track_ids = list(dict.fromkeys([*state.track_ids, *tracked_ids]))
+    state.protected_ids = [
+        track_id for track_id in current_ids
+        if track_id in protected_ids and track_id not in tracked_id_set
+    ]
     state.last_synced_at = _dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
     save_state(state)
 
@@ -768,11 +922,17 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         title=title,
         target_dir=str(target_dir),
         added=len(diff.added_ids),
-        removed=len(diff.removed_ids),
+        removed=0,
+        retained=len(diff.removed_ids),
         unchanged=len(diff.unchanged_ids),
         analyzed=len(features),
         failed_downloads=failed_downloads,
+        download_outcomes=[
+            _download_outcome_to_dict(result) for result in download_results
+        ],
+        protected_ids=state.protected_ids,
         push=push_summary,
+        paths=[str(path) for path in current_paths],
         features=[features_to_dict(item) for item in features],
     )
     return 0
@@ -802,6 +962,58 @@ def _cmd_list_playlist_tracks(args: argparse.Namespace) -> int:
 def _cmd_rekordbox_waveform(args: argparse.Namespace) -> int:
     result = rekordbox_waveform(str(args.content_id), max_points=int(args.max_points))
     _print_json({"ok": True, "waveform": asdict(result)})
+    return 0
+
+
+def _cmd_editor_load(args: argparse.Namespace) -> int:
+    payload = _load_payload(args.payload)
+    result = load_editor(
+        content_id=str(payload.get("content_id") or ""),
+        path=str(payload.get("path") or ""),
+    )
+    _print_json({"ok": True, "editor": result})
+    return 0
+
+
+def _cmd_editor_save_draft(args: argparse.Namespace) -> int:
+    result = save_draft(_load_payload(args.payload))
+    _print_json({"ok": True, "draft": result})
+    return 0
+
+
+def _cmd_editor_prepare_audition(args: argparse.Namespace) -> int:
+    result = prepare_audition(_load_payload(args.payload))
+    _print_json({"ok": True, "audition": result})
+    return 0
+
+
+def _cmd_editor_preview_apply(args: argparse.Namespace) -> int:
+    result = preview_apply(_load_payload(args.payload))
+    _print_json({"ok": True, "preview": result})
+    return 0
+
+
+def _cmd_editor_apply(args: argparse.Namespace) -> int:
+    result = apply_draft(_load_payload(args.payload))
+    _emit("done", ok=True, **result)
+    return 0
+
+
+def _cmd_editor_adopt_cues(args: argparse.Namespace) -> int:
+    result = adopt_cues(_load_payload(args.payload))
+    _print_json({"ok": True, **result})
+    return 0
+
+
+def _cmd_editor_reset_auto(args: argparse.Namespace) -> int:
+    result = reset_draft(_load_payload(args.payload))
+    _print_json({"ok": True, "draft": result})
+    return 0
+
+
+def _cmd_editor_rebase(args: argparse.Namespace) -> int:
+    result = rebase_draft(_load_payload(args.payload))
+    _print_json({"ok": True, "editor": result})
     return 0
 
 
@@ -901,19 +1113,6 @@ def _ids_from_paths(paths: list[Path]) -> list[str]:
     return ids
 
 
-def _resolve_removed_paths(target_dir: Path, removed_ids: list[str]) -> list[Path]:
-    if not removed_ids:
-        return []
-    target_dir = target_dir.expanduser()
-    out: list[Path] = []
-    for sid in removed_ids:
-        suffix = f"[{sid}].mp3"
-        for path in target_dir.glob("*.mp3"):
-            if path.name.endswith(suffix):
-                out.append(path.resolve())
-    return out
-
-
 def _config_to_dict(config: AppConfig) -> dict[str, Any]:
     data = asdict(config)
     data["output_dir"] = str(config.output_path)
@@ -929,6 +1128,7 @@ def _entry_to_dict(entry: DownloadEntry) -> dict[str, str]:
         "id": entry.id or "",
         "title": entry.title or "",
         "label": entry.label,
+        **({"artist": entry.artist} if entry.artist else {}),
     }
 
 
@@ -941,6 +1141,7 @@ def _entries_from_json(text: str) -> list[DownloadEntry]:
                 url=str(item.get("url") or ""),
                 id=str(item.get("id") or "") or None,
                 title=str(item.get("title") or "") or None,
+                artist=str(item.get("artist") or "") or None,
             )
         )
     return entries
@@ -967,9 +1168,32 @@ def _write_failed_report(results: list[DownloadResult], output_dir: Path) -> Pat
 
 def _result_error_to_dict(result: DownloadResult) -> dict[str, str]:
     return {
+        "id": result.entry.id or "",
+        "title": result.entry.title or result.entry.label,
         "url": result.entry.url,
         "label": result.entry.label,
         "error": result.error or "",
+        "reason": result.reason or "download",
+    }
+
+
+def _download_outcome_to_dict(result: DownloadResult) -> dict[str, Any]:
+    if result.ok and result.download_method == "klickaud":
+        outcome = "fallback_succeeded"
+    elif result.ok:
+        outcome = "primary_succeeded"
+    else:
+        outcome = "failed"
+    return {
+        "id": result.entry.id or "",
+        "title": result.entry.title or result.entry.label,
+        "url": result.entry.url,
+        "outcome": outcome,
+        "download_method": result.download_method if result.ok else "",
+        "fallback_attempted": result.fallback_attempted,
+        "primary_error": result.primary_error or "",
+        "error": result.error or "",
+        "paths": [str(path) for path in result.output_paths],
     }
 
 

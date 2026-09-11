@@ -1,3 +1,5 @@
+> Historical proposal. This document is retained for context; see the root README and current architecture for maintained behavior.
+
 # SoundCloud DL Desktop Product Plan
 
 Status: proposed

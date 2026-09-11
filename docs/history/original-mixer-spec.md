@@ -1,3 +1,5 @@
+> Historical proposal. This document is retained for context; see the root README and current architecture for maintained behavior.
+
 # Mixer — DJ Music Analysis Tool
 
 A two-deck DJ-style analysis app for tracks, bar-accurate looping, and Pioneer/Rekordbox-compatible cue export.

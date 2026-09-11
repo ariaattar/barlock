@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "SoundCloud DL",
+  "productName": "Crate",
   "version": "0.1.0",
   "identifier": "com.ariaattar.soundcloud-dl",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "SoundCloud DL",
+        "title": "Crate",
         "width": 1440,
         "height": 900,
         "minWidth": 1040,
@@ -20,19 +20,21 @@
         "center": true,
         "decorations": true,
         "transparent": false,
-        "backgroundColor": "#0a0a0a"
+        "backgroundColor": "#101012"
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420 soundcloud-audio: http://soundcloud-audio.localhost; media-src 'self' soundcloud-audio: http://soundcloud-audio.localhost"
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["app"],
+    "targets": [
+      "app"
+    ],
     "category": "Music",
-    "shortDescription": "SoundCloud to Rekordbox preparation",
-    "longDescription": "Download, analyze, and safely sync SoundCloud tracks and playlists into Rekordbox.",
+    "shortDescription": "Your next set starts here",
+    "longDescription": "Collect your SoundCloud finds, prepare your tracks, and bring your next set into Rekordbox.",
     "resources": {
       "resources/engine/": "engine/"
     }

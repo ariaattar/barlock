@@ -243,7 +243,7 @@ class TuiApp {
   private async mainLoop(): Promise<void> {
     while (this.running) {
       try {
-        const choice = await this.select("SoundCloud DL", [
+        const choice = await this.select("Crate", [
           {
             label: "Download only",
             description: "Track, playlist, or likes link -> folder in Downloads",
@@ -579,7 +579,7 @@ class TuiApp {
               const lines = [
                 `Title: ${raw.title}`,
                 `Folder: ${raw.target_dir}`,
-                raw.is_first_sync ? `First sync — ${raw.total_count} track(s) to download.` : `${raw.added.length} new, ${raw.removed_ids.length} removed, ${raw.unchanged_count} unchanged.`,
+                raw.is_first_sync ? `First sync — ${raw.total_count} track(s) to download.` : `${raw.added.length} new, ${raw.removed_ids.length} missing upstream (kept), ${raw.unchanged_count} unchanged.`,
               ]
               for (const line of lines) {
                 write(line)
@@ -592,7 +592,7 @@ class TuiApp {
             ? [`First sync of "${state.plan.title}".`, `Tracks: ${state.plan.total_count}`, `Folder: ${state.plan.target_dir}`]
             : [
                 `Re-sync of "${state.plan.title}".`,
-                `New: ${state.plan.added.length}   Removed: ${state.plan.removed_ids.length}   Unchanged: ${state.plan.unchanged_count}`,
+                `New: ${state.plan.added.length}   Missing upstream (kept): ${state.plan.removed_ids.length}   Unchanged: ${state.plan.unchanged_count}`,
                 `Folder: ${state.plan.target_dir}`,
               ]
           const preview = state.plan.added.slice(0, 6).map((entry, index) => `+ ${index + 1}. ${entry.label}`)
@@ -600,7 +600,7 @@ class TuiApp {
             preview.push(`+ ... ${state.plan.added.length - preview.length} more`)
           }
           if (state.plan.removed_ids.length) {
-            preview.push(`- ${state.plan.removed_ids.length} removed from SoundCloud`)
+            preview.push(`${state.plan.removed_ids.length} missing from SoundCloud — local files and Rekordbox entries will be kept`)
           }
           await this.message("Sync Plan", [...summary, "", ...preview], "Continue", flow())
           step += 1
@@ -652,7 +652,7 @@ class TuiApp {
             `Sync "${state.plan.title}" to Rekordbox playlist "${state.playlistName}".`,
             state.plan.is_first_sync
               ? `${state.plan.total_count} new track(s) to download.`
-              : `${state.plan.added.length} new   ${state.plan.removed_ids.length} removed   ${state.plan.unchanged_count} unchanged`,
+              : `${state.plan.added.length} new   ${state.plan.removed_ids.length} missing upstream (kept)   ${state.plan.unchanged_count} unchanged`,
             state.analyze ? "Analysis enabled for BPM, key, energy, and tags." : "Analysis disabled — collection only.",
             state.cueMode === "fill"
               ? "Hot cues: fill empty slots only; existing cues will not be changed."
@@ -723,7 +723,7 @@ class TuiApp {
           const lines: string[] = [
             `Title: ${final.title}`,
             `Folder: ${final.target_dir}`,
-            `Added: ${final.added}   Removed: ${final.removed}   Unchanged: ${final.unchanged}`,
+            `Added: ${final.added}   Kept despite upstream removal: ${final.retained || 0}   Unchanged: ${final.unchanged}`,
             push.playlist_name
               ? `Rekordbox playlist: ${push.playlist_name}`
               : "Rekordbox push skipped.",

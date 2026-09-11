@@ -18,6 +18,7 @@ class SyncState:
     rekordbox_playlist: str = ""
     rekordbox_playlist_id: str = ""
     track_ids: list[str] = field(default_factory=list)
+    protected_ids: list[str] = field(default_factory=list)
     last_synced_at: str = ""
 
     @property
@@ -46,7 +47,7 @@ def load_state(url: str) -> SyncState:
     if not isinstance(raw, dict):
         return SyncState(url=url)
     # Tolerate missing keys via dataclass defaults.
-    valid_keys = {"url", "title", "target_dir", "rekordbox_playlist", "rekordbox_playlist_id", "track_ids", "last_synced_at"}
+    valid_keys = {"url", "title", "target_dir", "rekordbox_playlist", "rekordbox_playlist_id", "track_ids", "protected_ids", "last_synced_at"}
     data = {k: v for k, v in raw.items() if k in valid_keys}
     data.setdefault("url", url)
     return SyncState(**data)

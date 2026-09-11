@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
+
+from app import audio_features
 
 from app.audio_features import (
     CueHint,
@@ -25,6 +29,76 @@ from app.audio_features import (
     _vocal_overlap_fraction,
     camelot_key,
 )
+
+
+def test_mp3_analysis_decodes_with_isolated_ffmpeg(monkeypatch):
+    import imageio_ffmpeg
+
+    commands = []
+    monkeypatch.setattr(imageio_ffmpeg, "get_ffmpeg_exe", lambda: "/bundled/ffmpeg")
+    def run(command, **kwargs):
+        commands.append(command)
+        assert kwargs["timeout"] == 120
+        return SimpleNamespace(returncode=0, stdout=np.array([0.25, -0.5], dtype="<f4").tobytes())
+    monkeypatch.setattr(audio_features.subprocess, "run", run)
+    monkeypatch.setattr(audio_features.sf, "info", lambda *_: pytest.fail("MP3 must not enter libsndfile"))
+    samples, rate = audio_features._load_analysis_audio(Path("track.mp3"), offset=600, duration=20)
+    assert rate == 22050
+    assert samples.tolist() == [0.25, -0.5]
+    assert commands[0][:7] == ["/bundled/ffmpeg", "-nostdin", "-v", "error", "-ss", "600", "-i"]
+    assert commands[0][8:10] == ["-t", "20"]
+
+
+def test_mp3_decode_error_is_reported(monkeypatch):
+    monkeypatch.setattr(audio_features.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1, stderr=b"invalid audio"))
+    with pytest.raises(RuntimeError, match="MP3 decoding failed for broken.mp3: invalid audio"):
+        audio_features._load_analysis_audio(Path("broken.mp3"), duration=10)
+
+
+def test_mp3_duration_does_not_use_libsndfile(monkeypatch):
+    import mutagen.mp3
+
+    monkeypatch.setattr(mutagen.mp3, "MP3", lambda _: SimpleNamespace(info=SimpleNamespace(length=123.5, sample_rate=44100)))
+    monkeypatch.setattr(audio_features.sf, "info", lambda *_: pytest.fail("MP3 must not enter libsndfile"))
+    assert audio_features._audio_info(Path("track.mp3")) == (123.5, 44100)
+
+
+def test_mp3_analysis_end_to_end(tmp_path):
+    from imageio_ffmpeg import get_ffmpeg_exe
+    from mutagen.easyid3 import EasyID3
+
+    path = tmp_path / "Test [123456789].mp3"
+    audio_features.subprocess.run([
+        get_ffmpeg_exe(), "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+        "sine=frequency=440:sample_rate=44100:duration=5", str(path),
+    ], check=True, capture_output=True, timeout=30)
+    tags = EasyID3()
+    tags["title"] = "Tagged title"
+    tags["artist"] = "Tagged artist"
+    tags.save(path)
+    result = audio_features.analyze_file(path, output_dir=tmp_path, use_cache=False)
+    assert result.sample_rate == 44100
+    assert result.duration_sec == pytest.approx(5, abs=0.1)
+    assert result.source_id == "123456789"
+    assert (result.title, result.artist) == ("Tagged title", "Tagged artist")
+
+
+def test_cached_analysis_uses_repaired_tags_without_decoding(monkeypatch, tmp_path):
+    from mutagen.easyid3 import EasyID3
+
+    path = tmp_path / "2297553080 [2297553080].mp3"
+    tags = EasyID3()
+    tags["title"] = "Apathy"
+    tags["artist"] = "Brunello, Hilel Lev"
+    tags.save(path)
+    cached = TrackFeatures(str(path), "2297553080", "", 240, 44100, 128, "Am", "8A", .9, -10, -1, 7, .1, [])
+    audio_features.save_analysis_features(cached)
+    monkeypatch.setattr(audio_features, "_analyze_uncached", lambda *a, **k: pytest.fail("Must reuse cached audio analysis"))
+    result = audio_features.analyze_file(path)
+    assert (result.title, result.artist) == ("Apathy", "Brunello, Hilel Lev")
+    assert result.bpm == cached.bpm
+    audio_features.write_id3_tags(path, result)
+    assert EasyID3(path)["title"] == ["Apathy"]
 
 
 def test_camelot_key_mapping_prefers_rekordbox_style_flats():
