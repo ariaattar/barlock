@@ -46,4 +46,3 @@
 .source-track-title strong { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
 .source-track-title small { font-size: 12px; color: var(--text-tertiary); }
 .source-track-row { min-height: 56px; }
-.import-actionbar { position: sticky; bottom: 0; z-index: 2; background: var(--canvas); padding: 16px 0; }

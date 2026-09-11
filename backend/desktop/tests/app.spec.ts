@@ -350,3 +350,31 @@ test("renders light and compact layouts without horizontal overflow", async ({ p
   expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.client)
   await page.screenshot({ path: '.artifacts/crate-import-compact.png' })
 })
+
+for (const viewport of [{ width: 1040, height: 680 }, { width: 1440, height: 900 }, { width: 2048, height: 1024 }]) {
+  test(`import actions never cover settings at ${viewport.width}px`, async ({ page }) => {
+    await page.setViewportSize(viewport)
+    await page.getByLabel('SoundCloud URL').fill('https://soundcloud.com/ariaattar/sets/set')
+    await page.getByRole('button', { name: 'Resolve', exact: true }).click()
+    await expect(page.getByText('Resolved source')).toBeVisible()
+    const workspace = page.locator('.import-workspace')
+    const footer = page.getByRole('contentinfo', { name: 'Import actions' })
+    for (const fraction of [0, .5, 1]) {
+      await workspace.evaluate((element, fraction) => { element.scrollTop = fraction * element.scrollHeight }, fraction)
+      const contentBox = await workspace.boundingBox()
+      const footerBox = await footer.boundingBox()
+      expect(contentBox!.y + contentBox!.height).toBeLessThanOrEqual(footerBox!.y + 1)
+      await expect(footer.getByRole('button', { name: 'Import 6 tracks' })).toBeInViewport()
+    }
+    await page.getByRole('button', { name: 'Fill empty slots', exact: true }).click()
+    await expect(page.getByRole('button', { name: 'Fill empty slots', exact: true })).toHaveAttribute('aria-pressed', 'true')
+    const cueBox = await page.locator('.cue-policy-row').boundingBox()
+    const footerBox = await footer.boundingBox()
+    expect(cueBox!.y + cueBox!.height).toBeLessThanOrEqual(footerBox!.y)
+    await page.getByRole('switch', { name: 'Analyze and tag' }).click()
+    await expect(page.getByRole('switch', { name: 'Analyze and tag' })).toHaveAttribute('aria-checked', 'false')
+    await page.getByRole('switch', { name: 'Analyze and tag' }).click()
+    await workspace.evaluate((element) => { element.scrollTop = element.scrollHeight })
+    await page.screenshot({ path: `.artifacts/crate-import-settings-${viewport.width}.png` })
+  })
+}

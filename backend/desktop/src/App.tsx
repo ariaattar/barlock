@@ -646,6 +646,7 @@ function ImportWorkspace({
   }
 
   return (
+    <div className="import-flow">
     <main className={`workspace import-workspace ${plan ? "has-plan" : ""}`}>
       <section className="import-intro"><div className="import-art" aria-hidden="true"><div className="record-sleeve sleeve-back" /><div className="record-sleeve sleeve-front"><span>CRATE SELECTS</span><div className="vinyl-disc"><i /></div><small>READY FOR YOUR NEXT SET</small></div></div>
         <div className="eyebrow"><span className="live-dot" />FROM DISCOVERY TO DECKS</div>
@@ -724,15 +725,19 @@ function ImportWorkspace({
               </div>
             ) : null}
           </div>
+
+        </section>
+      )}
+    </main>
+    {plan ? <footer className="import-footer" aria-label="Import actions">
           <div className="import-actionbar">
             <div className="action-safety"><ShieldCheck size={16} /><span>{destination === "rekordbox" ? "A database backup is created before every write." : "No Rekordbox changes will be made."}</span></div>
             <AppButton tone="primary" icon={destination === "rekordbox" ? Disc3 : Download} onClick={startImport} disabled={!plan.added.length && plan.is_first_sync}>
               {destination === "rekordbox" ? `Import ${plan.added.length || plan.total_count} tracks` : `Download ${plan.added.length || plan.total_count} tracks`}
             </AppButton>
           </div>
-        </section>
-      )}
-    </main>
+    </footer> : null}
+    </div>
   )
 }
 

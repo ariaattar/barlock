@@ -29,7 +29,7 @@ Branch: `codex/crate-design`. Audited the installed Tauri app using computer use
 | Narrow title columns, dense rows, repeated blue completion bars | Roomier 64px track rows, flexible title columns, readable artist lines, title tooltips, and progress only for active stages. |
 | All fallback successes tinted entire rows | Neutral completed rows with small status indicators; failure detail retains attention. |
 | Plain import header | A distinct Crate source-entry composition with restrained sleeve artwork and a clear SoundCloud link label. |
-| Large introductory content persisted after resolving | Compact source-review header and a sticky import action area. |
+| Large introductory content persisted after resolving | Compact source-review header and an action footer in its own layout row, outside the scrolling content. |
 | Source preview displayed titles with fabricated mini waveforms | Real title/artist metadata with a simple audio-file icon. |
 | Completed jobs kept a large active progress treatment | Quiet completion summary, ready state, and useful destination information. |
 | Playlist list repeated path/name and “Loaded” badges in every row | Useful hierarchy/path labels and a clear directional affordance; generated-cue removal is visually secondary and remains accessible. |
@@ -78,3 +78,11 @@ The native Doctor reported missing local collection files and two generated acti
 Test screenshots remain ignored under `backend/desktop/.artifacts/`. Release bundles, frozen workers, downloaded audio, caches, and database backups remain outside version control.
 
 Validated on macOS / Apple Silicon: 115 Python tests passed; all 16 Playwright scenarios passed; desktop and terminal TypeScript checks passed; OpenTUI smoke passed; Go launcher built and `--help` succeeded.
+
+## Import review correction
+
+| Before | After |
+| --- | --- |
+| Sticky action bar could cover analysis and cue controls while scrolling | Footer is a flex sibling of the scrollable workspace and reserves its own height. No overlap or stacking trick is needed. |
+| Import settings were separated by loose lines with a blue cue-policy band | One inset neutral settings panel, consistent padding, taller rows, and clearer option titles. |
+| Tests covered viewport overflow but missed settings under the footer | Three regression cases at 1040, 1440, and 2048px verify separation throughout scrolling and click both analysis and cue controls. All 19 desktop tests pass. |
